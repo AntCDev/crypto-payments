@@ -24,7 +24,7 @@ pub struct BalanceResponse {
 }
 
 pub async fn get_balance_handler(
-    State(_pool): State<PgPool>, // Axum requires this to match your router's state type
+    State(_pool): State<PgPool>,
     Json(payload): Json<BalanceRequest>,
 ) -> Result<Json<BalanceResponse>, (StatusCode, String)> {
     let network_lower = payload.network.to_lowercase();
@@ -40,10 +40,24 @@ pub async fn get_balance_handler(
                 "eth" => (url, None, 18),
                 "usdc" => (
                     url,
-                    Some("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string()), // Hardcoded Mainnet USDC Address
+                    Some("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string()), // Mainnet USDC
                     6,
                 ),
-                _ => return Err((StatusCode::BAD_REQUEST, format!("Unsupported currency '{}' for Ethereum in this test", payload.currency))),
+                _ => return Err((StatusCode::BAD_REQUEST, format!("Unsupported currency '{}' for Ethereum", payload.currency))),
+            }
+        }
+        "base" => {
+            let url = env::var("BASE_RPC_URL")
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "BASE_RPC_URL is not configured".to_string()))?;
+
+            match currency_lower.as_str() {
+                "eth" => (url, None, 18), // Base uses ETH for gas
+                "usdc" => (
+                    url,
+                    Some("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".to_string()), // Native USDC on Base
+                    6,
+                ),
+                _ => return Err((StatusCode::BAD_REQUEST, format!("Unsupported currency '{}' for Base", payload.currency))),
             }
         }
         "solana" | "sol" => {

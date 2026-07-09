@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::sleep;
+use hmac::{Hmac, Mac};
+use sha2::Sha512;
+use ed25519_dalek::SigningKey;
+use crate::services::wallet::CryptoWalletManager;
 
 // Generic structures for Solana JSON-RPC
 #[derive(Serialize)]
@@ -36,6 +40,8 @@ struct SolBalanceValue {
 struct SolTokenAccountsValue {
     value: Vec<serde_json::Value>,
 }
+
+// ### WATCHER ###
 
 pub struct SolWatcher {
     rpc_url: String,
@@ -189,4 +195,110 @@ impl CryptoWatcher for SolWatcher {
             sleep(Duration::from_secs(2)).await;
         }
     }
+}
+
+// ### WALLET ###
+pub struct SolWalletManager {
+    _is_testnet: bool,
+}
+
+impl SolWalletManager {
+    pub fn new(is_testnet: bool) -> Self {
+        // Note: Solana uses the exact same address format for mainnet, testnet, and devnet.
+        Self { _is_testnet: is_testnet }
+    }
+}
+
+#[async_trait]
+impl CryptoWalletManager for SolWalletManager {
+    async fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
+        // 1. Parse the mnemonic phrase using BIP39
+        let mnemonic_parsed = bip39::Mnemonic::parse(mnemonic)
+            .map_err(|e| format!("Invalid mnemonic: {}", e))?;
+
+        // 2. Generate the 64-byte cryptographic seed
+        let seed = mnemonic_parsed.to_seed("");
+
+        // 3. Construct and parse the derivation path into raw indices
+        let path_str = self.get_derivation_path(index)?;
+        let indices = parse_derivation_path(&path_str)?;
+
+        // 4. Derive Master Key using the SLIP-0010 master formula for ed25519
+        type HmacSha512 = Hmac<Sha512>;
+        let mut mac = HmacSha512::new_from_slice(b"ed25519 seed")
+            .map_err(|e| format!("HMAC initialization failed: {}", e))?;
+        mac.update(&seed);
+        let hmac_result = mac.finalize().into_bytes();
+
+        let mut secret_key: [u8; 32] = hmac_result[0..32].try_into().unwrap();
+        let mut chain_code: [u8; 32] = hmac_result[32..64].try_into().unwrap();
+
+        // 5. Iterate through path indices following SLIP-0010 child key derivation rules
+        for index in indices {
+            if index < 0x8000_0000 {
+                return Err("SLIP-0010 Ed25519 only supports hardened derivation paths".to_string());
+            }
+
+            let mut mac = HmacSha512::new_from_slice(&chain_code)
+                .map_err(|e| format!("HMAC initialization failed: {}", e))?;
+
+            mac.update(&[0x00]);
+            mac.update(&secret_key);
+            mac.update(&index.to_be_bytes());
+
+            let result = mac.finalize().into_bytes();
+            secret_key.copy_from_slice(&result[0..32]);
+            chain_code.copy_from_slice(&result[32..64]);
+        }
+
+        // 6. Generate the Ed25519 Public Key from the final derived secret key scalar
+        let signing_key = SigningKey::from_bytes(&secret_key);
+        let verifying_key = signing_key.verifying_key();
+
+        // 7. Solana addresses are simply the Base58 representation of the raw 32-byte public key point
+        Ok(bs58::encode(verifying_key.to_bytes()).into_string())
+    }
+
+    fn get_derivation_path(&self, index: u32) -> Result<String, String> {
+        // Modern Solana wallets (Phantom, Solflare) group multi-accounts at the third index.
+        // Format: m/44'/501'/{index}'/0'
+        Ok(format!("m/44'/501'/{}'/0'", index))
+    }
+
+    fn validate_address(&self, address: &str) -> bool {
+        // Standard Solana addresses are between 32 and 44 characters due to base58 variable length
+        if address.len() < 32 || address.len() > 44 {
+            return false;
+        }
+
+        // Validating means checking if it decodes cleanly into exactly 32 bytes
+        match bs58::decode(address).into_vec() {
+            Ok(bytes) => bytes.len() == 32,
+            Err(_) => false,
+        }
+    }
+}
+
+/// Helper function to parse a BIP44/SLIP10 derivation path string into raw u32 bits
+fn parse_derivation_path(path: &str) -> Result<Vec<u32>, String> {
+    if !path.starts_with("m/") {
+        return Err("Path must start with 'm/'".to_string());
+    }
+    let mut indices = Vec::new();
+    for part in path["m/".len()..].split('/') {
+        if part.is_empty() { continue; }
+        let is_hardened = part.ends_with('\'');
+        let num_str = if is_hardened {
+            &part[..part.len() - 1]
+        } else {
+            part
+        };
+        let val: u32 = num_str.parse().map_err(|e| format!("Invalid path segment: {}", e))?;
+        if is_hardened {
+            indices.push(val | 0x8000_0000); // Apply bitmask for hardened index flag
+        } else {
+            indices.push(val);
+        }
+    }
+    Ok(indices)
 }

@@ -5,6 +5,12 @@ use serde_json::json;
 use std::time::Duration;
 use tokio::time::sleep;
 
+use crate::services::wallet::CryptoWalletManager;
+use bip32::{DerivationPath, PrivateKey, XPrv};
+use bip39::Mnemonic;
+use sha3::{Digest, Keccak256};
+
+
 #[derive(Serialize)]
 struct RpcRequest {
     jsonrpc: &'static str,
@@ -24,14 +30,15 @@ struct RpcError {
     message: String,
 }
 
-pub struct EthWatcher {
+// ### WATCHER ###
+pub struct EvmWatcher {
     rpc_url: String,
     client: reqwest::Client,
     token_address: Option<String>, // None = Native ETH, Some = ERC-20 Token (USDC, etc.)
     decimals: u8,                  // 18 for ETH, 6 for USDC
 }
 
-impl EthWatcher {
+impl EvmWatcher {
     pub fn new(rpc_url: String, token_address: Option<String>, decimals: u8) -> Self {
         Self {
             rpc_url,
@@ -70,7 +77,7 @@ impl EthWatcher {
 }
 
 #[async_trait]
-impl CryptoWatcher for EthWatcher {
+impl CryptoWatcher for EvmWatcher {
     async fn get_balance(&self, address: &str) -> Result<f64, String> {
         let hex_balance = if let Some(ref contract_addr) = self.token_address {
             let clean_addr = address.trim_start_matches("0x");
@@ -161,5 +168,71 @@ impl CryptoWatcher for EthWatcher {
 
             sleep(Duration::from_secs(10)).await;
         }
+    }
+}
+
+
+// ### WALLET ###
+pub struct EvmWalletManager {
+    _is_testnet: bool,
+}
+
+impl EvmWalletManager {
+    pub fn new(is_testnet: bool) -> Self {
+        Self { _is_testnet: is_testnet }
+    }
+}
+
+#[async_trait]
+impl CryptoWalletManager for EvmWalletManager {
+    async fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
+        // 1. Parse the mnemonic phrase
+        let mnemonic_parsed = Mnemonic::parse(mnemonic)
+            .map_err(|e| format!("Invalid mnemonic: {}", e))?;
+
+        // 2. Generate the cryptographic seed directly as a 64-byte array
+        let seed = mnemonic_parsed.to_seed("");
+
+        // 3. Construct and parse the exact BIP44 derivation path
+        let path_str = self.get_derivation_path(index)?;
+        let path: DerivationPath = path_str
+            .parse()
+            .map_err(|e| format!("Failed to parse derivation path: {}", e))?;
+
+        // 4. Directly derive the child extended private key from the seed and path
+        let child_xprv = XPrv::derive_from_path(&seed, &path)
+            .map_err(|e| format!("Failed to derive child key at path: {}", e))?;
+
+        // 5. Extract the public key point from the derived private key
+        let secret_key = child_xprv.private_key();
+        let public_key = secret_key.public_key();
+
+        // 6. Get the uncompressed SEC1 representation (65 bytes: 0x04 prefix + 32-byte X + 32-byte Y)
+        let public_key_point = public_key.to_encoded_point(false);
+        let point_bytes = public_key_point.as_bytes();
+
+        // 7. EVM addresses are the last 20 bytes of the Keccak256 hash of the uncompressed 64-byte public key coordinate
+        let mut hasher = Keccak256::new();
+        hasher.update(&point_bytes[1..]); // Skip the 0x04 prefix byte
+        let hash_result = hasher.finalize();
+
+        // Take last 20 bytes
+        let address_bytes = &hash_result[12..];
+
+        Ok(format!("0x{}", hex::encode(address_bytes)))
+    }
+
+    fn get_derivation_path(&self, index: u32) -> Result<String, String> {
+        Ok(format!("m/44'/60'/0'/0/{}", index))
+    }
+
+    fn validate_address(&self, address: &str) -> bool {
+        let clean_addr = address.trim_start_matches("0x");
+
+        if clean_addr.len() != 40 {
+            return false;
+        }
+
+        clean_addr.chars().all(|c| c.is_ascii_hexdigit())
     }
 }
