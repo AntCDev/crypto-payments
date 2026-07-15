@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crypto Payment Processor Test</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen flex items-center justify-center p-4">
+
+    <div class="bg-gray-800 p-6 rounded-2xl shadow-xl border border-gray-700 max-w-md w-full text-center">
+        <h2 class="text-2xl font-bold mb-2 text-indigo-400">Crypto Invoice Router</h2>
+        <p class="text-gray-400 text-sm mb-6">Network: <span class="text-emerald-400 font-semibold">Base (Mainnet)</span></p>
+
+        <div class="bg-gray-900 p-4 rounded-xl border border-gray-700 text-left mb-6 space-y-2">
+            <div><span class="text-gray-500 text-xs block font-bold uppercase">Invoice ID</span><span id="invoiceId font-mono">INV-99231</span></div>
+            <div><span class="text-gray-500 text-xs block font-bold uppercase">Amount Due</span><span class="text-xl font-bold text-white">15.00 USDC</span></div>
+        </div>
+
+        <div class="space-y-3">
+            <button id="connectBtn" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-3 px-4 rounded-xl transition duration-200">
+                Connect Wallet via WalletConnect
+            </button>
+
+            <button id="payBtn" disabled class="w-full bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-medium py-3 px-4 rounded-xl transition duration-200">
+                Pay Invoice via Smart Contract
+            </button>
+        </div>
+
+        <div class="mt-6 pt-4 border-t border-gray-700 text-sm">
+            <p id="walletAddress" class="text-gray-400 font-mono truncate">Wallet: Not Connected</p>
+            <p id="status" class="text-yellow-400 mt-2 font-medium"></p>
+        </div>
+    </div>
+
+    <script type="module">
+        import { EthereumProvider } from 'https://esm.sh/@walletconnect/ethereum-provider';
+        import { ethers } from 'https://esm.sh/ethers';
+
+        // ==========================================
+        // GLOBAL CONFIGURATION & DUMMY VARIABLES
+        // ==========================================
+        const WALLETCONNECT_PROJECT_ID = '7aba1a66fad0cbd0745cca56acc6ee6f'; // Replace with your ID from cloud.reown.com
+        const BASE_CHAIN_ID = 8453; // Base Mainnet Chain ID
+
+        // Dummy values requested
+        const DUMMY_MERCHANT_CONTRACT = '0x1111111111111111111111111111111111111111';
+        const USDC_BASE_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bda02913'; // Real USDC contract address on Base
+        const INVOICE_ID = "INV-99231";
+        const AMOUNT_USD = "15.00";
+        const USDC_DECIMALS = 6; // USDC uses 6 decimals instead of 18
+
+        let provider;
+        let ethersProvider;
+        let signer;
+        let isConnected = false;
+
+        // Dom Elements
+        const connectBtn = document.getElementById('connectBtn');
+        const payBtn = document.getElementById('payBtn');
+        const walletAddressText = document.getElementById('walletAddress');
+        const statusText = document.getElementById('status');
+
+        // Initialize WalletConnect Provider Setup
+        async function init() {
+            if (WALLETCONNECT_PROJECT_ID === 'YOUR_WALLETCONNECT_PROJECT_ID') {
+                statusText.innerText = "Error: Please edit the HTML file and provide a real WalletConnect Project ID.";
+                return;
+            }
+
+            try {
+                provider = await EthereumProvider.init({
+                    projectId: WALLETCONNECT_PROJECT_ID,
+                    chains: [BASE_CHAIN_ID],
+                    showQrModal: true, // Automatically handles rendering the QR code overlay modal
+                    metadata: {
+                        name: "Rust Payment Processor",
+                        description: "Testing WalletConnect Integration",
+                        url: window.location.origin,
+                        icons: ["https://avatars.githubusercontent.com/u/37784886"]
+                    }
+                });
+
+                // Listen for structural state changes
+                provider.on("disconnect", () => {
+                    handleDisconnect();
+                });
+
+            } catch (err) {
+                console.error("Initialization failed", err);
+                statusText.innerText = "Failed to initialize WalletConnect.";
+            }
+        }
+
+        async function toggleConnect() {
+            if (isConnected) {
+                await provider.disconnect();
+                handleDisconnect();
+            } else {
+                statusText.innerText = "Opening WalletConnect Modal...";
+                try {
+					console.log(0)
+					await provider.connect();
+
+                    // Wrap the WalletConnect provider in an Ethers provider wrapper
+                    ethersProvider = new ethers.BrowserProvider(provider);
+					console.log(1)
+                    signer = await ethersProvider.getSigner();
+                    const userAddress = await signer.getAddress();
+
+                    isConnected = true;
+                    connectBtn.innerText = "Disconnect Wallet";
+                    connectBtn.classList.replace('bg-indigo-600', 'bg-red-600');
+                    connectBtn.classList.replace('hover:bg-indigo-500', 'hover:bg-red-500');
+
+                    walletAddressText.innerText = `Wallet: ${userAddress}`;
+                    statusText.innerText = "Connected successfully! Ready to pay.";
+                    payBtn.disabled = false;
+                } catch (err) {
+                    console.error("Connection rejected", err);
+                    statusText.innerText = "Connection rejected by user.";
+                }
+            }
+        }
+
+        async function processContractPayment() {
+            if (!signer) return;
+            statusText.innerText = "Preparing contract call payload...";
+
+            // Convert $15.00 to 15,000,000 atomic units (6 decimals)
+            const parsedAmount = ethers.parseUnits(AMOUNT_USD, USDC_DECIMALS);
+
+            // Define the Minimal ABI needed to talk to your custom payment smart contract
+            const customContractAbi = [
+                "function payInvoice(string memory invoiceId, address tokenAddress, uint256 amount) external"
+            ];
+
+            const merchantContract = new ethers.Contract(DUMMY_MERCHANT_CONTRACT, customContractAbi, signer);
+
+            try {
+                statusText.innerText = "Check your mobile wallet to approve the transaction...";
+
+                // Trigger the smart contract transaction via WalletConnect JSON-RPC bridge
+                const tx = await merchantContract.payInvoice(INVOICE_ID, USDC_BASE_ADDRESS, parsedAmount);
+
+                statusText.innerText = `Broadcasted! Hash: ${tx.hash.substring(0, 15)}... Waiting for block confirmation...`;
+
+                // Wait for the transaction to be mined on Base network
+                const receipt = await tx.wait();
+
+                statusText.className = "text-emerald-400 mt-2 font-medium";
+                statusText.innerText = `Payment Success! Verified in block ${receipt.blockNumber}.`;
+
+                console.log("Pass this receipt hash to your Rust backend:", receipt.hash);
+
+            } catch (err) {
+                console.error("Transaction failed", err);
+                statusText.innerText = `Transaction failed: ${err.message.substring(0, 50)}...`;
+            }
+        }
+
+        function handleDisconnect() {
+            isConnected = false;
+            connectBtn.innerText = "Connect Wallet via WalletConnect";
+            connectBtn.classList.replace('bg-red-600', 'bg-indigo-600');
+            connectBtn.classList.replace('hover:bg-red-500', 'hover:bg-indigo-500');
+            walletAddressText.innerText = "Wallet: Not Connected";
+            statusText.innerText = "Wallet disconnected.";
+            payBtn.disabled = true;
+        }
+
+        // Event Listeners
+        connectBtn.addEventListener('click', toggleConnect);
+        payBtn.addEventListener('click', processContractPayment);
+
+        // Run setup
+        init();
+    </script>
+</body>
+</html>
