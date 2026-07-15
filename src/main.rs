@@ -1,23 +1,28 @@
-use axum::{routing::post, Router};
+use axum::{routing::get, Router};
 use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use tower_http::compression::CompressionLayer;
 use std::env;
+use std::sync::Arc;
 
 // Register our modules globally
 mod api;
 mod models;
 mod services;
 mod networks;
+mod tokens;
 
-// Thread-safe Global Constants (equivalent to C# static readonly HashSets)
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: sqlx::PgPool,
+    pub registry: Arc<tokens::TokenRegistry>,
+}
+
 #[tokio::main]
 async fn main() {
-    // 1. Load the .env file from the Cargo.toml directory
     dotenvy::dotenv().ok();
 
-    // 2. Fetch the DATABASE_URL environment variable
     let database_url = env::var("DATABASE_URL")
         .expect("DATABASE_URL environment variable must be set in .env");
 
@@ -28,22 +33,25 @@ async fn main() {
         .await
         .expect("Failed to connect to PostgreSQL");
 
+    // Initialize the token registry completely at boot tracking configuration allocations
+    let registry = Arc::new(tokens::TokenRegistry::new());
+
+    let state = AppState { pool, registry };
+
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
     let app = Router::new()
-        // .route("/Api/CreateInvoice", post(api::payments::create_invoice))
-        .route("/api/balance", post(api::watcher::get_balance_handler))
-        
+        .route("/api/tokens", get(api::watcher::list_tokens_handler))
+
         // Middleware
         .fallback_service(ServeDir::new("wwwroot"))
         .layer(cors)
         .layer(CompressionLayer::new())
-        .with_state(pool);
+        .with_state(state); // Inject the wrapper state
 
-    // 3. Fetch and parse the PORT environment variable (fallback to 3000 if not found)
     let port: u16 = env::var("PORT")
         .unwrap_or_else(|_| "3000".to_string())
         .parse()
