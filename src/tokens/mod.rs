@@ -6,9 +6,30 @@ use async_trait::async_trait;
 pub mod eth;
 pub mod base;
 
+#[derive(Clone, Debug, Serialize)]
+pub struct PaymentDetails {
+    pub invoice_id: String,
+    pub network: String,
+    pub deposit_address: String,
+    pub token_address: Option<String>,
+    pub decimals: u8,
+    pub required_confirmations: u32,
+}
+
 #[async_trait]
 pub trait TokenHandler: Send + Sync {
-    async fn create_invoice(&self, id: &str, amount: f64) -> Result<String, String>;
+    fn token_id(&self) -> &str;
+
+    /// Called by the orchestrator after it has already logged the invoice.
+    /// Derives a deposit address, registers a watch on the underlying
+    /// network, and returns the network-specific details to persist.
+    async fn create_invoice_payment(
+        &self,
+        invoice_id: &str,
+        amount: rust_decimal::Decimal,
+    ) -> Result<PaymentDetails, String>;
+
+    async fn cancel_payment(&self, invoice_id: &str) -> Result<(), String>;
 }
 
 #[derive(Clone, Serialize)]

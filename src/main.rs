@@ -9,9 +9,9 @@ use std::sync::Arc;
 // Register our modules globally
 mod api;
 mod models;
-mod services;
 mod networks;
 mod tokens;
+mod orchestrator;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,7 +33,6 @@ async fn main() {
         .await
         .expect("Failed to connect to PostgreSQL");
 
-    // Initialize the token registry completely at boot tracking configuration allocations
     let registry = Arc::new(tokens::TokenRegistry::new());
 
     let state = AppState { pool, registry };
@@ -50,7 +49,7 @@ async fn main() {
         .fallback_service(ServeDir::new("wwwroot"))
         .layer(cors)
         .layer(CompressionLayer::new())
-        .with_state(state); // Inject the wrapper state
+        .with_state(state);
 
     let port: u16 = env::var("PORT")
         .unwrap_or_else(|_| "3000".to_string())

@@ -1,15 +1,21 @@
-use crate::services::watcher::CryptoWatcher;
+use super::{Amount, NetworkClient, PaymentWatch};
 use async_trait::async_trait;
+use uuid::Uuid;
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::sleep;
+
+use ed25519_dalek::SigningKey;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
-use ed25519_dalek::SigningKey;
-use crate::services::wallet::CryptoWalletManager;
 
-// Generic structures for Solana JSON-RPC
+// ==========================================
+// ### PRIVATE RPC STRUCTS ###
+// ==========================================
 #[derive(Serialize)]
 struct RpcRequest {
     jsonrpc: &'static str,
@@ -29,38 +35,27 @@ struct RpcError {
     message: String,
 }
 
-// Solana's getBalance returns an object containing context and the value
 #[derive(Deserialize)]
 struct SolBalanceValue {
     value: u64, // Lamports
 }
 
-// Used to grab the arbitrary nested array from getTokenAccountsByOwner
 #[derive(Deserialize)]
 struct SolTokenAccountsValue {
     value: Vec<serde_json::Value>,
 }
 
-// ### WATCHER ###
-
-pub struct SolWatcher {
+// ==========================================
+// ### NETWORK IMPLEMENTATION ###
+// ==========================================
+pub struct SolanaNetwork {
     rpc_url: String,
     client: reqwest::Client,
-    token_address: Option<String>, // None = Native SOL, Some = SPL Token Mint Address (e.g. USDC)
-    decimals: u8,                  // 9 for SOL, 6 for USDC
+    pending: Mutex<HashMap<Uuid, PaymentWatch>>,
 }
 
-impl SolWatcher {
-    pub fn new(rpc_url: String, token_address: Option<String>, decimals: u8) -> Self {
-        Self {
-            rpc_url,
-            client: reqwest::Client::new(),
-            token_address,
-            decimals,
-        }
-    }
-
-    // Generic RPC helper to handle different Solana response types cleanly
+impl SolanaNetwork {
+    /// Generic RPC helper to handle different Solana JSON-RPC response shapes cleanly
     async fn call_rpc<T: serde::de::DeserializeOwned>(
         &self,
         method: &'static str,
@@ -94,136 +89,26 @@ impl SolWatcher {
 }
 
 #[async_trait]
-impl CryptoWatcher for SolWatcher {
-    async fn get_balance(&self, address: &str) -> Result<f64, String> {
-        if let Some(ref mint_address) = self.token_address {
-            // --- SPL Token Balance Logic ---
-            let params = json!([
-                address,
-                { "mint": mint_address },
-                { "encoding": "jsonParsed" }
-            ]);
-
-            let response: SolTokenAccountsValue = self.call_rpc("getTokenAccountsByOwner", params).await?;
-
-            // If the user has never held or initialized this token account, the array is empty -> balance is 0.0
-            if response.value.is_empty() {
-                return Ok(0.0);
-            }
-
-            // Safely traverse Solana's deeply nested jsonParsed layout
-            let amount_str = response.value[0]
-                .get("account")
-                .and_then(|a| a.get("data"))
-                .and_then(|d| d.get("parsed"))
-                .and_then(|p| p.get("info"))
-                .and_then(|i| i.get("tokenAmount"))
-                .and_then(|t| t.get("amount"))
-                .and_then(|amt| amt.as_str())
-                .ok_or_else(|| "Failed to navigate token balance fields in RPC response".to_string())?;
-
-            // SPL token amounts are base-10 strings
-            let raw_units = amount_str.parse::<u128>()
-                .map_err(|_| "Failed to parse token balance integer".to_string())?;
-
-            let token_balance = raw_units as f64 / 10f64.powi(self.decimals as i32);
-            Ok(token_balance)
-        } else {
-            // --- Native SOL Balance Logic ---
-            let params = json!([address]);
-            let balance_info: SolBalanceValue = self.call_rpc("getBalance", params).await?;
-
-            // 1 SOL = 10^9 Lamports
-            let sol_balance = balance_info.value as f64 / 10f64.powi(self.decimals as i32);
-            Ok(sol_balance)
+impl NetworkClient for SolanaNetwork {
+    fn new(rpc_url: &str) -> Self {
+        Self {
+            rpc_url: rpc_url.to_string(),
+            client: reqwest::Client::new(),
+            pending: Mutex::new(HashMap::new()),
         }
     }
 
-    async fn get_current_block(&self, _rpc_url: &str) -> Result<u64, String> {
-        let block_height: u64 = self.call_rpc("getBlockHeight", json!([])).await?;
-        Ok(block_height)
-    }
+    // --- WALLET METHODS ---
 
-    async fn watch_payment(
-        &self,
-        address: &str,
-        target_amount: f64,
-        required_confirmations: u64,
-    ) -> Result<(), String> {
-        let asset_name = match &self.token_address {
-            Some(_) => "Token",
-            None => "SOL",
-        };
-        println!("Starting Solana payment watch for {} for {} {}...", address, target_amount, asset_name);
-
-        let initial_balance = self.get_balance(address).await?;
-        let target_balance = initial_balance + target_amount;
-        let mut detection_block: Option<u64> = None;
-
-        loop {
-            if detection_block.is_none() {
-                let current_balance = self.get_balance(address).await?;
-                if current_balance >= target_balance {
-                    let current_block = self.get_current_block(&self.rpc_url).await?;
-                    detection_block = Some(current_block);
-                    println!("Payment detected at block {}! Waiting for {} confirmations...", current_block, required_confirmations);
-                }
-            }
-            else if let Some(detected_at) = detection_block {
-                let current_block = self.get_current_block(&self.rpc_url).await?;
-
-                let confirmations = if current_block >= detected_at {
-                    (current_block - detected_at) + 1
-                } else {
-                    0
-                };
-
-                println!("Progress: {}/{} confirmations", confirmations, required_confirmations);
-
-                if confirmations >= required_confirmations {
-                    let final_balance = self.get_balance(address).await?;
-                    if final_balance >= target_balance {
-                        println!("Solana payment fully confirmed!");
-                        return Ok(());
-                    } else {
-                        println!("⚠ Fork detected! Balance dropped below threshold. Resetting watch state.");
-                        detection_block = None;
-                    }
-                }
-            }
-
-            sleep(Duration::from_secs(2)).await;
-        }
-    }
-}
-
-// ### WALLET ###
-pub struct SolWalletManager {
-    _is_testnet: bool,
-}
-
-impl SolWalletManager {
-    pub fn new(is_testnet: bool) -> Self {
-        // Note: Solana uses the exact same address format for mainnet, testnet, and devnet.
-        Self { _is_testnet: is_testnet }
-    }
-}
-
-#[async_trait]
-impl CryptoWalletManager for SolWalletManager {
-    async fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
-        // 1. Parse the mnemonic phrase using BIP39
+    fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
         let mnemonic_parsed = bip39::Mnemonic::parse(mnemonic)
             .map_err(|e| format!("Invalid mnemonic: {}", e))?;
 
-        // 2. Generate the 64-byte cryptographic seed
         let seed = mnemonic_parsed.to_seed("");
 
-        // 3. Construct and parse the derivation path into raw indices
-        let path_str = self.get_derivation_path(index)?;
+        let path_str = self.get_derivation_path(index);
         let indices = parse_derivation_path(&path_str)?;
 
-        // 4. Derive Master Key using the SLIP-0010 master formula for ed25519
         type HmacSha512 = Hmac<Sha512>;
         let mut mac = HmacSha512::new_from_slice(b"ed25519 seed")
             .map_err(|e| format!("HMAC initialization failed: {}", e))?;
@@ -233,9 +118,8 @@ impl CryptoWalletManager for SolWalletManager {
         let mut secret_key: [u8; 32] = hmac_result[0..32].try_into().unwrap();
         let mut chain_code: [u8; 32] = hmac_result[32..64].try_into().unwrap();
 
-        // 5. Iterate through path indices following SLIP-0010 child key derivation rules
-        for index in indices {
-            if index < 0x8000_0000 {
+        for idx in indices {
+            if idx < 0x8000_0000 {
                 return Err("SLIP-0010 Ed25519 only supports hardened derivation paths".to_string());
             }
 
@@ -244,42 +128,189 @@ impl CryptoWalletManager for SolWalletManager {
 
             mac.update(&[0x00]);
             mac.update(&secret_key);
-            mac.update(&index.to_be_bytes());
+            mac.update(&idx.to_be_bytes());
 
             let result = mac.finalize().into_bytes();
             secret_key.copy_from_slice(&result[0..32]);
             chain_code.copy_from_slice(&result[32..64]);
         }
 
-        // 6. Generate the Ed25519 Public Key from the final derived secret key scalar
         let signing_key = SigningKey::from_bytes(&secret_key);
         let verifying_key = signing_key.verifying_key();
 
-        // 7. Solana addresses are simply the Base58 representation of the raw 32-byte public key point
         Ok(bs58::encode(verifying_key.to_bytes()).into_string())
     }
 
-    fn get_derivation_path(&self, index: u32) -> Result<String, String> {
-        // Modern Solana wallets (Phantom, Solflare) group multi-accounts at the third index.
-        // Format: m/44'/501'/{index}'/0'
-        Ok(format!("m/44'/501'/{}'/0'", index))
+    fn get_derivation_path(&self, index: u32) -> String {
+        format!("m/44'/501'/{}'/0'", index)
     }
 
     fn validate_address(&self, address: &str) -> bool {
-        // Standard Solana addresses are between 32 and 44 characters due to base58 variable length
         if address.len() < 32 || address.len() > 44 {
             return false;
         }
 
-        // Validating means checking if it decodes cleanly into exactly 32 bytes
         match bs58::decode(address).into_vec() {
             Ok(bytes) => bytes.len() == 32,
             Err(_) => false,
         }
     }
+
+    // --- CHAIN STATE METHODS ---
+
+    async fn get_native_balance(&self, address: &str) -> Result<Amount, String> {
+        let params = json!([address]);
+        let balance_info: SolBalanceValue = self.call_rpc("getBalance", params).await?;
+
+        // Native SOL RPC returns Lamports directly as a u64, safely convert to u128
+        Ok(Amount(balance_info.value as u128))
+    }
+
+    async fn get_token_balance(
+        &self,
+        token_address: &str,
+        address: &str,
+        _decimals: u8, // Unused since we deal strictly in raw u128 atomic units now
+    ) -> Result<Amount, String> {
+        let params = json!([
+            address,
+            { "mint": token_address },
+            { "encoding": "jsonParsed" }
+        ]);
+
+        let response: SolTokenAccountsValue = self.call_rpc("getTokenAccountsByOwner", params).await?;
+
+        if response.value.is_empty() {
+            return Ok(Amount(0));
+        }
+
+        // Safe extraction layer through Solana's heavily nested JSON structure
+        let amount_str = response.value[0]
+            .get("account")
+            .and_then(|a| a.get("data"))
+            .and_then(|d| d.get("parsed"))
+            .and_then(|p| p.get("info"))
+            .and_then(|i| i.get("tokenAmount"))
+            .and_then(|t| t.get("amount"))
+            .and_then(|amt| amt.as_str())
+            .ok_or_else(|| "Failed to navigate token balance fields in RPC response".to_string())?;
+
+        let raw_units = amount_str.parse::<u128>()
+            .map_err(|_| "Failed to parse token balance integer".to_string())?;
+
+        Ok(Amount(raw_units))
+    }
+
+    async fn get_current_block(&self) -> Result<u64, String> {
+        let block_height: u64 = self.call_rpc("getBlockHeight", json!([])).await?;
+        Ok(block_height)
+    }
+
+    // --- BATCHED WATCHING METHODS ---
+
+    fn register_payment(&self, watch: PaymentWatch) {
+        if let Ok(mut pending) = self.pending.lock() {
+            println!("SolanaNetwork::register_payment for invoice: {}", watch.invoice_id);
+            pending.insert(watch.invoice_id, watch);
+        }
+    }
+
+    fn unregister_payment(&self, invoice_id: Uuid) {
+        if let Ok(mut pending) = self.pending.lock() {
+            println!("SolanaNetwork::unregister_payment for invoice: {}", invoice_id);
+            pending.remove(&invoice_id);
+        }
+    }
+
+    async fn watch_payments(&self) -> Result<(), String> {
+        println!("SolanaNetwork::watch_payments processing loop started on {}", self.rpc_url);
+
+        struct TrackingState {
+            target_balance: u128, // Changed from f64 to u128
+            detection_block: Option<u64>,
+        }
+        let mut tracking_registry: HashMap<Uuid, TrackingState> = HashMap::new();
+
+        loop {
+            // Snapshot active watches under short lock
+            let current_watches: Vec<PaymentWatch> = match self.pending.lock() {
+                Ok(p) => p.values().cloned().collect(),
+                Err(_) => return Err("Pending payments lock poisoned".to_string()),
+            };
+
+            // Clean tracking register of components dropped externally
+            tracking_registry.retain(|id, _| current_watches.iter().any(|w| w.invoice_id == *id));
+
+            if !current_watches.is_empty() {
+                let current_block = self.get_current_block().await?;
+                let mut completed_invoices = Vec::new();
+
+                for watch in current_watches {
+                    let state = if let Some(s) = tracking_registry.get_mut(&watch.invoice_id) {
+                        s
+                    } else {
+                        let initial_balance = match &watch.token_address {
+                            Some(token) => self.get_token_balance(token, &watch.address, watch.decimals).await?.0,
+                            None => self.get_native_balance(&watch.address).await?.0,
+                        };
+                        tracking_registry.insert(watch.invoice_id, TrackingState {
+                            target_balance: initial_balance + watch.target_amount,
+                            detection_block: None,
+                        });
+                        tracking_registry.get_mut(&watch.invoice_id).unwrap()
+                    };
+
+                    let current_balance = match &watch.token_address {
+                        Some(token) => self.get_token_balance(token, &watch.address, watch.decimals).await?.0,
+                        None => self.get_native_balance(&watch.address).await?.0,
+                    };
+
+                    if state.detection_block.is_none() {
+                        if current_balance >= state.target_balance {
+                            state.detection_block = Some(current_block);
+                            println!(
+                                "Solana Invoice {}: Payment detected at block {}! Awaiting {} confirmations...",
+                                watch.invoice_id, current_block, watch.required_confirmations
+                            );
+                        }
+                    } else if let Some(detected_at) = state.detection_block {
+                        let confirmations = if current_block >= detected_at {
+                            (current_block - detected_at) + 1
+                        } else {
+                            0
+                        };
+
+                        println!(
+                            "Solana Invoice {}: Confirmation progress: {}/{}",
+                            watch.invoice_id, confirmations, watch.required_confirmations
+                        );
+
+                        if confirmations >= watch.required_confirmations as u64 {
+                            if current_balance >= state.target_balance {
+                                println!("Solana Invoice {}: Payment fully confirmed successfully!", watch.invoice_id);
+                                completed_invoices.push(watch.invoice_id);
+                            } else {
+                                println!("Solana Invoice {}: ⚠ Fork/Re-org detected! Resetting tracker.", watch.invoice_id);
+                                state.detection_block = None;
+                            }
+                        }
+                    }
+                }
+
+                for id in completed_invoices {
+                    self.unregister_payment(id);
+                }
+            }
+
+            // Solana block times are fast, loop operates at a swift 2-second heartbeat
+            sleep(Duration::from_secs(2)).await;
+        }
+    }
 }
 
-/// Helper function to parse a BIP44/SLIP10 derivation path string into raw u32 bits
+// ==========================================
+// ### PRIVATE UTILITY FUNCTIONS ###
+// ==========================================
 fn parse_derivation_path(path: &str) -> Result<Vec<u32>, String> {
     if !path.starts_with("m/") {
         return Err("Path must start with 'm/'".to_string());
@@ -295,7 +326,7 @@ fn parse_derivation_path(path: &str) -> Result<Vec<u32>, String> {
         };
         let val: u32 = num_str.parse().map_err(|e| format!("Invalid path segment: {}", e))?;
         if is_hardened {
-            indices.push(val | 0x8000_0000); // Apply bitmask for hardened index flag
+            indices.push(val | 0x8000_0000);
         } else {
             indices.push(val);
         }
