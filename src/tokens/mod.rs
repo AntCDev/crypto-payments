@@ -2,34 +2,41 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use serde::Serialize;
 use async_trait::async_trait;
+use uuid::Uuid;
+use sqlx::PgPool;
+use chrono::{DateTime, Utc};
 
 pub mod eth;
 pub mod base;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PaymentDetails {
-    pub invoice_id: String,
+    pub invoice_id: Uuid,
     pub network: String,
     pub deposit_address: String,
     pub token_address: Option<String>,
     pub decimals: u8,
     pub required_confirmations: u32,
+    pub wallet_index: i32,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[async_trait]
 pub trait TokenHandler: Send + Sync {
     fn token_id(&self) -> &str;
 
-    /// Called by the orchestrator after it has already logged the invoice.
-    /// Derives a deposit address, registers a watch on the underlying
-    /// network, and returns the network-specific details to persist.
+    /// Called by the orchestrator after it has already logged the initial invoice record.
+    /// Derives a deposit address, registers a watch on the underlying network, 
+    /// executes database updates for the invoice, and returns the final payment details.
     async fn create_invoice_payment(
         &self,
-        invoice_id: &str,
+        pool: &PgPool,
+        invoice_id: Uuid,
         amount: rust_decimal::Decimal,
     ) -> Result<PaymentDetails, String>;
 
-    async fn cancel_payment(&self, invoice_id: &str) -> Result<(), String>;
+    /// Cancels payment watching and cleans up allocations for the given invoice.
+    async fn cancel_payment(&self, pool: &PgPool, invoice_id: Uuid) -> Result<(), String>;
 }
 
 #[derive(Clone, Serialize)]
