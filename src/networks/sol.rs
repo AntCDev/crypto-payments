@@ -12,6 +12,7 @@ use tokio::time::sleep;
 use ed25519_dalek::SigningKey;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
+use sqlx::PgPool;
 
 // ==========================================
 // ### PRIVATE RPC STRUCTS ###
@@ -50,6 +51,7 @@ struct SolTokenAccountsValue {
 // ==========================================
 pub struct SolanaNetwork {
     rpc_url: String,
+    network_name: String,
     client: reqwest::Client,
     pending: Mutex<HashMap<Uuid, PaymentWatch>>,
 }
@@ -86,21 +88,8 @@ impl SolanaNetwork {
 
         rpc_res.result.ok_or_else(|| "No result found in RPC response".to_string())
     }
-}
 
-#[async_trait]
-impl NetworkClient for SolanaNetwork {
-    fn new(rpc_url: &str) -> Self {
-        Self {
-            rpc_url: rpc_url.to_string(),
-            client: reqwest::Client::new(),
-            pending: Mutex::new(HashMap::new()),
-        }
-    }
-
-    // --- WALLET METHODS ---
-
-    fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
+    pub fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
         let mnemonic_parsed = bip39::Mnemonic::parse(mnemonic)
             .map_err(|e| format!("Invalid mnemonic: {}", e))?;
 
@@ -139,6 +128,29 @@ impl NetworkClient for SolanaNetwork {
         let verifying_key = signing_key.verifying_key();
 
         Ok(bs58::encode(verifying_key.to_bytes()).into_string())
+    }
+}
+
+#[async_trait]
+impl NetworkClient for SolanaNetwork {
+    fn new(rpc_url: &str) -> Self {
+        let network_name = "SOL".to_string();
+        
+        Self {
+            rpc_url: rpc_url.to_string(),
+            network_name,
+            client: reqwest::Client::new(),
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    // --- WALLET METHODS ---
+    async fn get_derive_address(&self, pool: &PgPool, merchant_id: Uuid, mnemonic: &str ) -> Result<(String, u32), String> {
+        // Solana is an account-based architecture, so like EVM, it does not suffer from UTXO address gaps.
+        // We safely default to index 0 for the merchant's deployment layout.
+        let index = 0;
+        let address = self.derive_address(mnemonic, index)?;
+        Ok((address, index))
     }
 
     fn get_derivation_path(&self, index: u32) -> String {

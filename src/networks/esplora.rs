@@ -13,6 +13,7 @@ use bip39::Mnemonic;
 use sha2::{Digest, Sha256};
 use ripemd::Ripemd160;
 use bech32::{u5, ToBase32, Variant};
+use sqlx::PgPool;
 
 // ==========================================
 // ### PRIVATE ESPLORA DATA STRUCTURES ###
@@ -54,29 +55,15 @@ pub struct EsploraVout {
 // ==========================================
 pub struct EsploraNetwork {
     api_url: String,
+    network_name: String,
     client: reqwest::Client,
     is_testnet: bool,
     pending: Mutex<HashMap<Uuid, PaymentWatch>>,
 }
-
-#[async_trait]
-impl NetworkClient for EsploraNetwork {
-    fn new(rpc_url: &str) -> Self {
-        // Automatically deduce the network type context based on standard endpoint keywords
-        let url_lower = rpc_url.to_lowercase();
-        let is_testnet = url_lower.contains("testnet") || url_lower.contains("signet") || url_lower.contains("tb");
-
-        Self {
-            api_url: rpc_url.to_string(),
-            client: reqwest::Client::new(),
-            is_testnet,
-            pending: Mutex::new(HashMap::new()),
-        }
-    }
-
-    // --- WALLET METHODS ---
-
-    fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
+impl EsploraNetwork {
+    /// Inherent helper method to derive a Native SegWit (Bech32) address for a given index.
+    /// Kept out of the trait interface to allow specialized internal invocation patterns.
+    pub fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
         let mnemonic_parsed = Mnemonic::parse(mnemonic)
             .map_err(|e| format!("Invalid mnemonic: {}", e))?;
 
@@ -115,6 +102,39 @@ impl NetworkClient for EsploraNetwork {
             .map_err(|e| format!("Bech32 encoding failed: {}", e))?;
 
         Ok(address)
+    }
+}
+
+#[async_trait]
+impl NetworkClient for EsploraNetwork {
+    fn new(rpc_url: &str) -> Self {
+        // Automatically deduce the network type context based on standard endpoint keywords
+        let url_lower = rpc_url.to_lowercase();
+        let is_testnet = url_lower.contains("testnet") || url_lower.contains("signet") || url_lower.contains("tb");
+        let network_name = "EVM".to_string();
+
+        Self {
+            api_url: rpc_url.to_string(),
+            network_name,
+            client: reqwest::Client::new(),
+            is_testnet,
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    // --- WALLET METHODS ---
+    async fn get_derive_address(&self, pool: &PgPool, merchant_id: Uuid, mnemonic: &str ) -> Result<(String, u32), String> {
+        // -------------------------------------------------------------------------------------
+        // TODO: Implement UTXO Address Gap Limit Logic
+        // -------------------------------------------------------------------------------------
+        // Because Bitcoin uses a UTXO model, standard BIP44/BIP84 wallet software enforces a
+        // "gap limit" (usually 20 addresses). If we derive too far ahead without any transactions
+        // occurring on intermediate addresses, standard wallets will stop scanning and miss funds.
+        // -------------------------------------------------------------------------------------
+
+        let index = 0; // Placeholder until DB & gap-lookahead scanning logic is added
+        let address = self.derive_address(mnemonic, index)?;
+        Ok((address, index))
     }
 
     fn get_derivation_path(&self, index: u32) -> String {

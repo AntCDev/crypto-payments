@@ -1,10 +1,38 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use uuid::Uuid;
+use std::sync::Arc;
 
 pub mod evm;
 pub mod sol;
 pub mod esplora;
+
+#[derive(Clone)]
+pub struct NetworkRegistry {
+    pub evm: Arc<evm::EVMNetwork>,
+    pub sol: Arc<sol::SolanaNetwork>,
+    pub esplora: Arc<esplora::EsploraNetwork>,
+}
+
+impl NetworkRegistry {
+    pub fn from_env() -> Self {
+        let ethereum_rpc = std::env::var("ETHEREUM_RPC_URL")
+            .expect("ETHEREUM_RPC_URL environment variable must be set");
+
+        let solana_rpc = std::env::var("SOLANA_RPC_URL")
+            .expect("SOLANA_RPC_URL environment variable must be set");
+
+        let esplora_api = std::env::var("BITCOIN_ESPLORA_URL")
+            .expect("BITCOIN_ESPLORA_URL environment variable must be set");
+
+        Self {
+            evm: Arc::new(evm::EVMNetwork::new(&ethereum_rpc)),
+            sol: Arc::new(sol::SolanaNetwork::new(&solana_rpc)),
+            esplora: Arc::new(esplora::EsploraNetwork::new(&esplora_api)),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct PaymentWatch {
@@ -29,7 +57,7 @@ pub trait NetworkClient: Send + Sync {
         Self: Sized;
 
     // wallet
-    fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String>;
+    async fn get_derive_address(&self, pool: &PgPool, merchant_id: Uuid, mnemonic: &str) -> Result<(String, u32), String>;
     fn get_derivation_path(&self, index: u32) -> String;
     fn validate_address(&self, address: &str) -> bool;
 

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 use sqlx::PgPool;
 use chrono::{DateTime, Utc};
+use crate::networks::NetworkRegistry; // Import your central network registry
 
 pub mod eth;
 pub mod base;
@@ -16,8 +17,8 @@ pub struct PaymentDetails {
     pub deposit_address: String,
     pub token_address: Option<String>,
     pub decimals: u8,
-    pub required_confirmations: u32,
-    pub wallet_index: i32,
+    pub required_confirmations: i32,
+    pub wallet_index: u32,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -25,17 +26,14 @@ pub struct PaymentDetails {
 pub trait TokenHandler: Send + Sync {
     fn token_id(&self) -> &str;
 
-    /// Called by the orchestrator after it has already logged the initial invoice record.
-    /// Derives a deposit address, registers a watch on the underlying network, 
-    /// executes database updates for the invoice, and returns the final payment details.
     async fn create_invoice_payment(
         &self,
         pool: &PgPool,
+        merchant_id: Uuid,
         invoice_id: Uuid,
         amount: rust_decimal::Decimal,
     ) -> Result<PaymentDetails, String>;
 
-    /// Cancels payment watching and cleans up allocations for the given invoice.
     async fn cancel_payment(&self, pool: &PgPool, invoice_id: Uuid) -> Result<(), String>;
 }
 
@@ -53,14 +51,16 @@ pub struct TokenRegistry {
 }
 
 impl TokenRegistry {
-    pub fn new() -> Self {
+    /// Accepts the shared single-instance networks on initialization
+    pub fn new(networks: Arc<NetworkRegistry>) -> Self {
         let mut registry = Self {
             handlers: HashMap::new(),
             metadata: Vec::new(),
         };
 
-        eth::register(&mut registry);
-        base::register(&mut registry);
+        // Pass the networks registry forward to sub-modules
+        eth::register(&mut registry, networks.clone());
+        base::register(&mut registry, networks.clone());
 
         registry
     }

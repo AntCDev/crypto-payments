@@ -7,7 +7,6 @@ use std::sync::Arc;
 use axum::{routing::{get, post}, Router};
 
 // Register our modules globally
-mod models;
 mod networks;
 mod tokens;
 mod api;
@@ -16,6 +15,7 @@ mod orchestrator;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: sqlx::PgPool,
+    pub networks: Arc<networks::NetworkRegistry>,
     pub registry: Arc<tokens::TokenRegistry>,
     pub orchestrator: Arc<orchestrator::PaymentOrchestrator>,
 }
@@ -102,13 +102,21 @@ async fn main() {
         .await
         .expect("Failed to initialize database tables");
 
-    let registry = Arc::new(tokens::TokenRegistry::new());
+    // 1. Instantiate the networks ONCE on load
+    let networks = Arc::new(networks::NetworkRegistry::from_env());
 
-    // Instantiate Orchestrator and wrap it inside AppState
-    let orchestrator = Arc::new(orchestrator::PaymentOrchestrator::new(pool.clone(), registry.clone()));
+    // 2. Pass the singletons down to the token registry so handlers can clone the Arcs
+    let registry = Arc::new(tokens::TokenRegistry::new(networks.clone()));
+
+    // 3. Instantiate Orchestrator and pass the required dependencies
+    let orchestrator = Arc::new(orchestrator::PaymentOrchestrator::new(
+        pool.clone(),
+        registry.clone()
+    ));
 
     let state = AppState {
         pool,
+        networks,
         registry,
         orchestrator
     };
@@ -121,8 +129,6 @@ async fn main() {
     let app = Router::new()
         .route("/api/tokens", get(api::watcher::list_tokens_handler))
         .route("/api/invoices", post(api::invoices::create_invoice_handler))
-
-        // Middleware
         .fallback_service(ServeDir::new("wwwroot"))
         .layer(cors)
         .layer(CompressionLayer::new())

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use uuid::Uuid;
 use chrono::{Utc, Duration};
-use crate::networks::NetworkClient;
+use crate::networks::{NetworkClient, NetworkRegistry};
 
 pub struct EthHandler {
     network: Arc<EVMNetwork>,
@@ -20,6 +20,7 @@ impl TokenHandler for EthHandler {
     async fn create_invoice_payment(
         &self,
         pool: &PgPool,
+        merchant_id: Uuid,
         invoice_id: Uuid,
         amount: rust_decimal::Decimal,
     ) -> Result<PaymentDetails, String> {
@@ -41,7 +42,7 @@ impl TokenHandler for EthHandler {
         let expires_at = Utc::now() + Duration::minutes(60);
 
         // 4. UPDATE THE DATABASE RECORD:
-        //    Apply the `deposit_address`, `derived_wallet_index`, and `expires_at` 
+        //    Apply the `deposit_address`, `derived_wallet_index`, and `expires_at`
         //    directly into the DB row identified by `invoice_id`.
         //
         // 5. REGISTER CHAIN WATCHER:
@@ -71,14 +72,16 @@ impl TokenHandler for EthHandler {
     }
 }
 
-pub fn register(registry: &mut TokenRegistry) {
-    let network = Arc::new(EVMNetwork::new("https://eth-rpc.example.com"));
+pub fn register(registry: &mut TokenRegistry, networks: Arc<NetworkRegistry>) {
+    let handler = EthHandler {
+        network: networks.evm.clone(),
+    };
 
     registry.register_token(
         "USDC_ETH",
         "USDC",
-        "Eth",
+        "Eth.",
         "USDC on the mainnet built using crates.",
-        EthHandler { network },
+        handler,
     );
 }

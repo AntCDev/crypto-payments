@@ -21,12 +21,12 @@ impl PaymentOrchestrator {
         &self,
         merchant_id: Uuid,
         token_id: &str,
-        amount_requested: rust_decimal::Decimal,
+        amount_requested: Decimal,
         data: Option<String>,
     ) -> Result<Uuid, String> {
 
         // 1. Determine temporary expiration window
-        let default_expiration = chrono::Utc::now() + chrono::Duration::hours(1);
+        let default_expiration = Utc::now() + Duration::hours(1);
 
         // 2. Insert initial database skeleton
         let row = sqlx::query!(
@@ -56,9 +56,11 @@ impl PaymentOrchestrator {
             .get_handler(token_id)
             .ok_or_else(|| format!("No handler registered for token {}", token_id))?;
 
+
+        //PASS TokenID to the handler themselves, to support multi token handlers, like generic 'BASE HANDLER'
         // 4. Delegate database update & watcher creation straight to the handler
         let details = handler
-            .create_invoice_payment(&self.pool, invoice_id, amount_requested)
+            .create_invoice_payment(&self.pool, merchant_id, invoice_id, amount_requested)
             .await?;
 
         println!("Invoice provisioning complete: {:?}", details);

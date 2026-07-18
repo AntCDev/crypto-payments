@@ -12,6 +12,7 @@ use tokio::time::sleep;
 use bip32::{DerivationPath, PrivateKey, XPrv};
 use bip39::Mnemonic;
 use sha3::{Digest, Keccak256};
+use sqlx::PgPool;
 
 // ==========================================
 // ### PRIVATE RPC STRUCTS ###
@@ -40,6 +41,7 @@ struct RpcError {
 // ==========================================
 pub struct EVMNetwork {
     rpc_url: String,
+    network_name: String,
     client: reqwest::Client,
     pending: Mutex<HashMap<Uuid, PaymentWatch>>,
 }
@@ -85,21 +87,7 @@ impl EVMNetwork {
 
         Ok(Amount(raw_units))
     }
-}
-
-#[async_trait]
-impl NetworkClient for EVMNetwork {
-    fn new(rpc_url: &str) -> Self {
-        Self {
-            rpc_url: rpc_url.to_string(),
-            client: reqwest::Client::new(),
-            pending: Mutex::new(HashMap::new()),
-        }
-    }
-
-    // --- WALLET METHODS ---
-
-    fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
+    pub fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
         let mnemonic_parsed = Mnemonic::parse(mnemonic)
             .map_err(|e| format!("Invalid mnemonic: {}", e))?;
 
@@ -126,6 +114,51 @@ impl NetworkClient for EVMNetwork {
         let address_bytes = &hash_result[12..];
 
         Ok(format!("0x{}", hex::encode(address_bytes)))
+    }
+
+}
+
+#[async_trait]
+impl NetworkClient for EVMNetwork {
+    fn new(rpc_url: &str) -> Self {
+        let network_name = "EVM".to_string();
+        
+        Self {
+            rpc_url: rpc_url.to_string(),
+            network_name,
+            client: reqwest::Client::new(),
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    // --- WALLET METHODS ---
+    async fn get_derive_address(&self, pool: &PgPool, merchant_id: Uuid, mnemonic: &str ) -> Result<(String, u32), String> {
+
+        // Atomically increment and fetch the index to avoid race conditions
+        let row = sqlx::query!(
+            r#"
+            INSERT INTO merchant_network_indices (merchant_id, network, next_index)
+            VALUES ($1, $2, 1)
+            ON CONFLICT (merchant_id, network)
+            DO UPDATE SET
+                next_index = merchant_network_indices.next_index + 1,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING next_index
+            "#,
+            merchant_id,
+            self.network_name
+        )
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("Failed to update merchant network index: {}", e))?;
+
+        // The query returns the *new* next_index, so our current index is next_index - 1
+        let index = (row.next_index - 1) as u32;
+
+        // Pass it to your existing pure synchronous derivation logic
+        let address = self.derive_address(mnemonic, index)?;
+
+        Ok((address, index))
     }
 
     fn get_derivation_path(&self, index: u32) -> String {
