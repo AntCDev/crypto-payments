@@ -60,7 +60,7 @@ impl PaymentOrchestrator {
         //PASS TokenID to the handler themselves, to support multi token handlers, like generic 'BASE HANDLER'
         // 4. Delegate database update & watcher creation straight to the handler
         let details = handler
-            .create_invoice_payment(&self.pool, merchant_id, invoice_id, amount_requested)
+            .create_invoice_payment(&self.pool, merchant_id, invoice_id, amount_requested, token_id)
             .await?;
 
         println!("Invoice provisioning complete: {:?}", details);

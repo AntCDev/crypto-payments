@@ -1,11 +1,26 @@
+// tokens/eth.rs
 use crate::networks::evm::EVMNetwork;
+use crate::networks::{NetworkClient, NetworkRegistry};
 use crate::tokens::{PaymentDetails, TokenHandler, TokenRegistry};
 use async_trait::async_trait;
 use std::sync::Arc;
 use sqlx::PgPool;
 use uuid::Uuid;
 use chrono::{Utc, Duration};
-use crate::networks::{NetworkClient, NetworkRegistry};
+
+pub fn register(registry: &mut TokenRegistry, networks: Arc<NetworkRegistry>) {
+    let handler = EthHandler {
+        network: networks.evm_chain(1), // Ethereum mainnet
+    };
+
+    registry.register_token(
+        "USDC_ETH",
+        "USD Coin (Ethereum)",
+        "USDC stablecoin hosted natively on the Ethereum Mainnet.",
+        "Requires 12 network confirmations.",
+        handler,
+    );
+}
 
 pub struct EthHandler {
     network: Arc<EVMNetwork>,
@@ -23,31 +38,28 @@ impl TokenHandler for EthHandler {
         merchant_id: Uuid,
         invoice_id: Uuid,
         amount: rust_decimal::Decimal,
+        _token_id: &str,
     ) -> Result<PaymentDetails, String> {
-        println!("EthHandler::create_invoice_payment(invoice: {invoice_id}, amount: {amount})");
+        // TODO: Replace with real merchant mnemonic fetching mechanism when ready
+        let merchant_mnemonic = "test test test test test test test test test test test junk";
 
-        // -------------------------------------------------------------------------
-        // WHAT HAPPENS INSIDE THIS HANDLER:
-        // -------------------------------------------------------------------------
-        // 1. QUERY & ACQUIRE INDEX:
-        //    Fetch/reserve the next BIP-44 public derivation index for Mainnet Ethereum.
-        let derived_wallet_index = 108;
+        // Dynamic key derivation using the shared EVM network helper
+        let (deposit_address, derived_wallet_index, payment_reference) = self.network
+            .get_derive_address(pool, merchant_id, invoice_id, merchant_mnemonic)
+            .await
+            .map_err(|e| format!("Address derivation failed: {e}"))?;
 
-        // 2. DERIVE DEPOSIT ADDRESS:
-        //    Derive the public address on Ethereum path m/44'/60'/0'/0/108.
-        let deposit_address = "0xa0b8...eth_derived_address".to_string();
-
-        // 3. DEFINE EXPIRATION:
-        //    Mainnet transactions can take longer; set a 60-minute payment window.
+        // Mainnet transactions take longer; keeping your 60-minute payment window
         let expires_at = Utc::now() + Duration::minutes(60);
 
-        // 4. UPDATE THE DATABASE RECORD:
-        //    Apply the `deposit_address`, `derived_wallet_index`, and `expires_at`
-        //    directly into the DB row identified by `invoice_id`.
-        //
-        // 5. REGISTER CHAIN WATCHER:
-        //    Register a watch request with the EVM background block listener.
-        // -------------------------------------------------------------------------
+        // Update the database record using the matching SQLX structure
+        sqlx::query!(
+            r#"UPDATE invoices SET wallet_address = $1, wallet_index = $2, expires_at = $3, payment_reference = $4 WHERE id = $5"#,
+            deposit_address, derived_wallet_index as i32, expires_at, payment_reference, invoice_id
+        )
+            .execute(pool)
+            .await
+            .map_err(|e| format!("DB update failed: {e}"))?;
 
         Ok(PaymentDetails {
             invoice_id,
@@ -55,7 +67,7 @@ impl TokenHandler for EthHandler {
             deposit_address,
             token_address: Some("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string()), // Real Ethereum USDC contract
             decimals: 6,
-            required_confirmations: 12, // Mainnet requires higher confirmations
+            required_confirmations: 12, // Higher threshold for Mainnet safety
             wallet_index: derived_wallet_index,
             expires_at,
         })
@@ -63,25 +75,6 @@ impl TokenHandler for EthHandler {
 
     async fn cancel_payment(&self, _pool: &PgPool, invoice_id: Uuid) -> Result<(), String> {
         println!("EthHandler::cancel_payment({invoice_id})");
-        // -------------------------------------------------------------------------
-        // WHAT HAPPENS HERE:
-        // 1. De-register the active EVM transaction watcher for the target address.
-        // 2. Clear out any pending locks or state.
-        // -------------------------------------------------------------------------
         Ok(())
     }
-}
-
-pub fn register(registry: &mut TokenRegistry, networks: Arc<NetworkRegistry>) {
-    let handler = EthHandler {
-        network: networks.evm.clone(),
-    };
-
-    registry.register_token(
-        "USDC_ETH",
-        "USDC",
-        "Eth.",
-        "USDC on the mainnet built using crates.",
-        handler,
-    );
 }

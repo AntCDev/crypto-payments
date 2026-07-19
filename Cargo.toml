@@ -21,13 +21,14 @@ bip32 = "0.5.3"
 sha3 = "0.12.0"
 hex = "0.4.3"
 
-ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
-hmac = "0.12.1"
-sha2 = "0.10.8"       # Used for SHA512 in SLIP-0010
+ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
+hmac = "0.13.0"
+sha2 = "0.11.0"       # Used for SHA512 in SLIP-0010
 bs58 = "0.5.1"       # Solana standard address representation
 
-ripemd = "0.1.3"
-bech32 = "0.9.1"
+ripemd = "0.2.0"
+bech32 = { version = "0.12.0", features = [] }
 uuid = { version = "1.23.5", features = ["v4", "serde"] }
 rust_decimal = "1.42.1"
 chrono = { version = "0.4.45", features = ["serde"] }
+futures = "0.3.33"

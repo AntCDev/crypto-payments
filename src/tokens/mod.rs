@@ -32,6 +32,7 @@ pub trait TokenHandler: Send + Sync {
         merchant_id: Uuid,
         invoice_id: Uuid,
         amount: rust_decimal::Decimal,
+        token_id: &str,
     ) -> Result<PaymentDetails, String>;
 
     async fn cancel_payment(&self, pool: &PgPool, invoice_id: Uuid) -> Result<(), String>;

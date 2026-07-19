@@ -11,6 +11,7 @@ use tokio::time::sleep;
 
 use bip32::{DerivationPath, PrivateKey, XPrv};
 use bip39::Mnemonic;
+use sha2::Sha256;
 use sha3::{Digest, Keccak256};
 use sqlx::PgPool;
 
@@ -40,40 +41,82 @@ struct RpcError {
 // ### NETWORK IMPLEMENTATION ###
 // ==========================================
 pub struct EVMNetwork {
-    rpc_url: String,
-    network_name: String,
+    chain_id: u64,
+    pub network_name: String, // Added field
+    rpc_urls: Vec<String>,
     client: reqwest::Client,
     pending: Mutex<HashMap<Uuid, PaymentWatch>>,
 }
 
 impl EVMNetwork {
-    /// Helper to execute JSON-RPC calls against the configured endpoint
-    async fn call_rpc(&self, method: &'static str, params: serde_json::Value) -> Result<String, String> {
-        let payload = RpcRequest {
-            jsonrpc: "2.0",
-            method,
-            params,
-            id: 1,
-        };
+    pub fn new(chain_id: u64, rpc_urls: Vec<String>) -> Self {
+        assert!(!rpc_urls.is_empty(), "EVMNetwork requires at least one RPC URL");
+        let network_name = format!("EVM_{}", chain_id);
 
-        let response = self.client
-            .post(&self.rpc_url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| format!("HTTP Request failed: {}", e))?;
+        Self {
+            chain_id,
+            network_name,
+            rpc_urls,
+            client: reqwest::Client::new(),
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
 
-        let rpc_res: RpcResponse = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
+    async fn call_rpc_single(&self, url: &str, method: &'static str, params: serde_json::Value) -> Result<String, String> {
+        let payload = RpcRequest { jsonrpc: "2.0", method, params, id: 1 };
+
+        let response = self.client.post(url).json(&payload).send().await
+            .map_err(|e| format!("HTTP request to {url} failed: {e}"))?;
+
+        let rpc_res: RpcResponse = response.json().await
+            .map_err(|e| format!("Failed to parse JSON response from {url}: {e}"))?;
 
         if let Some(err) = rpc_res.error {
-            return Err(format!("RPC Error: {}", err.message));
+            return Err(format!("RPC Error from {url}: {}", err.message));
         }
 
-        rpc_res.result.ok_or_else(|| "No result found in RPC response".to_string())
+        rpc_res.result.ok_or_else(|| format!("No result in RPC response from {url}"))
     }
+
+    /// Fans out to every configured endpoint for this chain and only trusts a
+    /// result once at least 2 of them agree. With a single-URL config (local
+    /// dev, testnets where you only have one provider) it skips straight to
+    /// that node — quorum only kicks in when you've actually configured >1 URL.
+    async fn call_rpc(&self, method: &'static str, params: serde_json::Value) -> Result<String, String> {
+        if self.rpc_urls.len() == 1 {
+            return self.call_rpc_single(&self.rpc_urls[0], method, params).await;
+        }
+
+        let futures = self.rpc_urls.iter()
+            .map(|url| self.call_rpc_single(url, method, params.clone()));
+        let results: Vec<Result<String, String>> = futures::future::join_all(futures).await;
+
+        let oks: Vec<&String> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+
+        if oks.len() < 2 {
+            let errs: Vec<&String> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+            return Err(format!(
+                "Quorum failed for {method} on chain {}: only {}/{} endpoints responded. Errors: {:?}",
+                self.chain_id, oks.len(), self.rpc_urls.len(), errs
+            ));
+        }
+
+        // Return the first value that at least 2 endpoints agree on.
+        for candidate in &oks {
+            if oks.iter().filter(|v| *v == candidate).count() >= 2 {
+                return Ok((*candidate).clone());
+            }
+        }
+
+        // All responded but none matched — e.g. a 3-way split during a reorg.
+        // This isn't something a "tiebreaker" can resolve (there's no majority
+        // to break a tie toward), so treat it as transient and let the caller retry.
+        Err(format!(
+            "Quorum disagreement for {method} on chain {}: endpoints returned different values: {:?}",
+            self.chain_id, oks
+        ))
+    }
+
 
     /// Internal parser to get raw integer units directly from hexadecimal outputs
     fn parse_hex_balance(hex_str: &str) -> Result<Amount, String> {
@@ -115,26 +158,23 @@ impl EVMNetwork {
 
         Ok(format!("0x{}", hex::encode(address_bytes)))
     }
+}
 
+pub fn derive_reference_bytes(invoice_id: Uuid) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(invoice_id.as_bytes());
+    hasher.finalize().into()
 }
 
 #[async_trait]
 impl NetworkClient for EVMNetwork {
-    fn new(rpc_url: &str) -> Self {
-        let network_name = "EVM".to_string();
-        
-        Self {
-            rpc_url: rpc_url.to_string(),
-            network_name,
-            client: reqwest::Client::new(),
-            pending: Mutex::new(HashMap::new()),
-        }
-    }
-
-    // --- WALLET METHODS ---
-    async fn get_derive_address(&self, pool: &PgPool, merchant_id: Uuid, mnemonic: &str ) -> Result<(String, u32), String> {
-
-        // Atomically increment and fetch the index to avoid race conditions
+    async fn get_derive_address(
+        &self,
+        pool: &PgPool,
+        merchant_id: Uuid,
+        invoice_id: Uuid,
+        mnemonic: &str,
+    ) -> Result<(String, u32, Option<String>), String> {
         let row = sqlx::query!(
             r#"
             INSERT INTO merchant_network_indices (merchant_id, network, next_index)
@@ -146,19 +186,20 @@ impl NetworkClient for EVMNetwork {
             RETURNING next_index
             "#,
             merchant_id,
-            self.network_name
+            self.network_name // Dynamically uses "EVM_1", "EVM_8453", etc.
         )
             .fetch_one(pool)
             .await
             .map_err(|e| format!("Failed to update merchant network index: {}", e))?;
 
-        // The query returns the *new* next_index, so our current index is next_index - 1
         let index = (row.next_index - 1) as u32;
-
-        // Pass it to your existing pure synchronous derivation logic
         let address = self.derive_address(mnemonic, index)?;
 
-        Ok((address, index))
+        // bytes32 reference for contract call param / indexed log topic
+        let reference_bytes = derive_reference_bytes(invoice_id);
+        let reference = format!("0x{}", hex::encode(reference_bytes));
+
+        Ok((address, index, Some(reference)))
     }
 
     fn get_derivation_path(&self, index: u32) -> String {
@@ -178,27 +219,14 @@ impl NetworkClient for EVMNetwork {
     // --- CHAIN STATE METHODS ---
 
     async fn get_native_balance(&self, address: &str) -> Result<Amount, String> {
-        let params = json!([address, "latest"]);
-        let hex_balance = self.call_rpc("eth_getBalance", params).await?;
+        let hex_balance = self.call_rpc("eth_getBalance", json!([address, "latest"])).await?;
         Self::parse_hex_balance(&hex_balance)
     }
 
-    async fn get_token_balance(
-        &self,
-        token_address: &str,
-        address: &str,
-        _decimals: u8, // Prefixed with underscore as raw u128 logic does not require scaling here
-    ) -> Result<Amount, String> {
+    async fn get_token_balance(&self, token_address: &str, address: &str, _decimals: u8) -> Result<Amount, String> {
         let clean_addr = address.trim_start_matches("0x");
-        let data = format!("0x70a08231{:0>64}", clean_addr); // balanceOf selector
-
-        let params = json!([
-            {
-                "to": token_address,
-                "data": data
-            },
-            "latest"
-        ]);
+        let data = format!("0x70a08231{:0>64}", clean_addr);
+        let params = json!([{ "to": token_address, "data": data }, "latest"]);
         let hex_balance = self.call_rpc("eth_call", params).await?;
         Self::parse_hex_balance(&hex_balance)
     }
@@ -228,11 +256,15 @@ impl NetworkClient for EVMNetwork {
     }
 
     async fn watch_payments(&self) -> Result<(), String> {
-        println!("EVMNetwork::watch_payments processing loop started on {}", self.rpc_url);
+        println!(
+            "EVMNetwork::watch_payments processing loop started for {} (Endpoints configured: {})",
+            self.network_name,
+            self.rpc_urls.len()
+        );
 
         // Persistent tracking state scoped to the worker loop lifecycle
         struct TrackingState {
-            target_balance: u128, // Changed from f64 to u128
+            target_balance: u128,
             detection_block: Option<u64>,
         }
         let mut tracking_registry: HashMap<Uuid, TrackingState> = HashMap::new();
@@ -261,7 +293,7 @@ impl NetworkClient for EVMNetwork {
                             None => self.get_native_balance(&watch.address).await?.0,
                         };
                         tracking_registry.insert(watch.invoice_id, TrackingState {
-                            target_balance: initial_balance + watch.target_amount, // Safe integer addition
+                            target_balance: initial_balance + watch.target_amount,
                             detection_block: None,
                         });
                         tracking_registry.get_mut(&watch.invoice_id).unwrap()
@@ -311,7 +343,7 @@ impl NetworkClient for EVMNetwork {
                 }
             }
 
-            sleep(Duration::from_secs(10)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     }
 }

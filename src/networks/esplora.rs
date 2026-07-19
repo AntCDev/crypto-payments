@@ -1,4 +1,4 @@
-use super::{Amount, NetworkClient, PaymentWatch};
+use super::{Amount, BitcoinNetwork, NetworkClient, PaymentWatch};
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -12,7 +12,7 @@ use bip32::{DerivationPath, PrivateKey, XPrv};
 use bip39::Mnemonic;
 use sha2::{Digest, Sha256};
 use ripemd::Ripemd160;
-use bech32::{u5, ToBase32, Variant};
+use bech32::{Hrp, segwit};
 use sqlx::PgPool;
 
 // ==========================================
@@ -54,15 +54,85 @@ pub struct EsploraVout {
 // ### NETWORK IMPLEMENTATION ###
 // ==========================================
 pub struct EsploraNetwork {
-    api_url: String,
-    network_name: String,
+    api_urls: Vec<String>, // Upgraded to support redundant URLs
+    network_name: String,   // Dynamically configured (e.g., "BTC_MAINNET")
     client: reqwest::Client,
     is_testnet: bool,
     pending: Mutex<HashMap<Uuid, PaymentWatch>>,
 }
+
 impl EsploraNetwork {
+    /// Inherent constructor matching the initialization pattern in NetworkRegistry
+    pub fn new(network: BitcoinNetwork, api_urls: Vec<String>) -> Self {
+        assert!(!api_urls.is_empty(), "EsploraNetwork requires at least one API URL");
+
+        // Dynamically compute the network name for DB tracking
+        let network_name = format!("BTC_{:?}", network).to_uppercase();
+
+        let is_testnet = match network {
+            BitcoinNetwork::Mainnet => false,
+            BitcoinNetwork::Testnet4 | BitcoinNetwork::Signet => true,
+        };
+
+        Self {
+            api_urls,
+            network_name,
+            client: reqwest::Client::new(),
+            is_testnet,
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Internal helper that queries a single REST URL endpoint
+    async fn request_api_single(&self, base_url: &str, path: &str) -> Result<String, String> {
+        let full_url = format!("{}{}", base_url, path);
+        let response = self.client
+            .get(&full_url)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request to {full_url} failed: {e}"))?;
+
+        let text = response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read body from {full_url}: {e}"))?;
+
+        Ok(text)
+    }
+
+    /// Replicates your EVM quorum strategy: fans out to all Esplora REST endpoints
+    /// and expects a minimum agreement threshold of 2 nodes.
+    async fn request_api(&self, path: &str) -> Result<String, String> {
+        if self.api_urls.len() == 1 {
+            return self.request_api_single(&self.api_urls[0], path).await;
+        }
+
+        let futures = self.api_urls.iter().map(|url| self.request_api_single(url, path));
+        let results: Vec<Result<String, String>> = futures::future::join_all(futures).await;
+        let oks: Vec<&String> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+
+        if oks.len() < 2 {
+            let errs: Vec<&String> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+            return Err(format!(
+                "Quorum failed for path {path} on network {}: only {}/{} endpoints responded. Errors: {:?}",
+                self.network_name, oks.len(), self.api_urls.len(), errs
+            ));
+        }
+
+        // Return the first value that at least 2 endpoints agree on
+        for candidate in &oks {
+            if oks.iter().filter(|v| *v == candidate).count() >= 2 {
+                return Ok((*candidate).clone());
+            }
+        }
+
+        Err(format!(
+            "Quorum disagreement for path {path} on network {}: endpoints returned different values: {:?}",
+            self.network_name, oks
+        ))
+    }
+
     /// Inherent helper method to derive a Native SegWit (Bech32) address for a given index.
-    /// Kept out of the trait interface to allow specialized internal invocation patterns.
     pub fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
         let mnemonic_parsed = Mnemonic::parse(mnemonic)
             .map_err(|e| format!("Invalid mnemonic: {}", e))?;
@@ -91,50 +161,57 @@ impl EsploraNetwork {
         ripemd_hasher.update(&sha256_result);
         let hash160 = ripemd_hasher.finalize();
 
-        let hrp = if self.is_testnet { "tb" } else { "bc" };
+        let hrp_str = if self.is_testnet { "tb" } else { "bc" };
+        let hrp = Hrp::parse(hrp_str)
+            .map_err(|e| format!("Invalid HRP prefix: {}", e))?;
 
-        let mut base32_data = vec![
-            u5::try_from_u8(0).map_err(|e| format!("Invalid witness version element: {:?}", e))?
-        ];
-        base32_data.extend_from_slice(&hash160.to_base32());
-
-        let address = bech32::encode(hrp, base32_data, Variant::Bech32)
+        let address = segwit::encode(hrp, segwit::VERSION_0, &hash160)
             .map_err(|e| format!("Bech32 encoding failed: {}", e))?;
 
         Ok(address)
     }
 }
-
+pub fn derive_reference_bytes(invoice_id: Uuid) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(invoice_id.as_bytes());
+    hasher.finalize().into()
+}
 #[async_trait]
 impl NetworkClient for EsploraNetwork {
-    fn new(rpc_url: &str) -> Self {
-        // Automatically deduce the network type context based on standard endpoint keywords
-        let url_lower = rpc_url.to_lowercase();
-        let is_testnet = url_lower.contains("testnet") || url_lower.contains("signet") || url_lower.contains("tb");
-        let network_name = "EVM".to_string();
-
-        Self {
-            api_url: rpc_url.to_string(),
-            network_name,
-            client: reqwest::Client::new(),
-            is_testnet,
-            pending: Mutex::new(HashMap::new()),
-        }
-    }
-
     // --- WALLET METHODS ---
-    async fn get_derive_address(&self, pool: &PgPool, merchant_id: Uuid, mnemonic: &str ) -> Result<(String, u32), String> {
-        // -------------------------------------------------------------------------------------
-        // TODO: Implement UTXO Address Gap Limit Logic
-        // -------------------------------------------------------------------------------------
-        // Because Bitcoin uses a UTXO model, standard BIP44/BIP84 wallet software enforces a
-        // "gap limit" (usually 20 addresses). If we derive too far ahead without any transactions
-        // occurring on intermediate addresses, standard wallets will stop scanning and miss funds.
-        // -------------------------------------------------------------------------------------
+    async fn get_derive_address(
+        &self,
+        pool: &PgPool,
+        merchant_id: Uuid,
+        invoice_id: Uuid,
+        mnemonic: &str,
+    ) -> Result<(String, u32, Option<String>), String> {
+        // Automatically tracks and increments the merchant's key index per specific BTC network
+        let row = sqlx::query!(
+            r#"
+            INSERT INTO merchant_network_indices (merchant_id, network, next_index)
+            VALUES ($1, $2, 1)
+            ON CONFLICT (merchant_id, network)
+            DO UPDATE SET
+                next_index = merchant_network_indices.next_index + 1,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING next_index
+            "#,
+            merchant_id,
+            self.network_name
+        )
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("Failed to update merchant network index: {}", e))?;
 
-        let index = 0; // Placeholder until DB & gap-lookahead scanning logic is added
+        let index = (row.next_index - 1) as u32;
         let address = self.derive_address(mnemonic, index)?;
-        Ok((address, index))
+
+        // Keeping tracking references uniform across your processing layer
+        let reference_bytes = crate::networks::evm::derive_reference_bytes(invoice_id);
+        let reference = format!("0x{}", hex::encode(reference_bytes));
+
+        Ok((address, index, Some(reference)))
     }
 
     fn get_derivation_path(&self, index: u32) -> String {
@@ -143,42 +220,35 @@ impl NetworkClient for EsploraNetwork {
     }
 
     fn validate_address(&self, address: &str) -> bool {
-        match bech32::decode(address) {
-            Ok((hrp, data, variant)) => {
+        match segwit::decode(address) {
+            Ok((hrp, version, program)) => {
                 let expected_hrp = if self.is_testnet { "tb" } else { "bc" };
 
-                if hrp != expected_hrp || variant != Variant::Bech32 {
-                    return false;
-                }
-                if data.is_empty() || data[0] != u5::try_from_u8(0).unwrap() {
+                if hrp.as_str() != expected_hrp {
                     return false;
                 }
 
-                data.len() == 33
+                if version != segwit::VERSION_0 {
+                    return false;
+                }
+
+                program.len() == 20
             }
             Err(_) => false,
         }
     }
 
     // --- CHAIN STATE METHODS ---
-
     async fn get_native_balance(&self, address: &str) -> Result<Amount, String> {
-        let url = format!("{}/address/{}", self.api_url, address);
+        let path = format!("/address/{}", address);
+        let raw_json = self.request_api(&path).await?;
 
-        let res: EsploraAddressResponse = self.client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("Esplora request failed: {}", e))?
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse Esplora response: {}", e))?;
+        let res: EsploraAddressResponse = serde_json::from_str(&raw_json)
+            .map_err(|e| format!("Failed to parse Esplora balance payload: {}", e))?;
 
         let total_satoshis = (res.chain_stats.funded_txo_sum + res.mempool_stats.funded_txo_sum)
             .saturating_sub(res.chain_stats.spent_txo_sum + res.mempool_stats.spent_txo_sum);
 
-        // Native Bitcoin uses 8 decimals; Esplora already returns values in atomic Satoshis.
-        // We can cast directly to u128 without float conversions.
         Ok(Amount(total_satoshis as u128))
     }
 
@@ -188,29 +258,18 @@ impl NetworkClient for EsploraNetwork {
         _address: &str,
         _decimals: u8,
     ) -> Result<Amount, String> {
-        // Esplora APIs focus exclusively on Layer-1 Bitcoin UTXOs
         println!("⚠ Warning: Token balance query ignored. Esplora layer-1 architecture does not track custom tokens.");
         Ok(Amount(0))
     }
 
     async fn get_current_block(&self) -> Result<u64, String> {
-        let url = format!("{}/blocks/tip/height", self.api_url);
+        let raw_text = self.request_api("/blocks/tip/height").await?;
 
-        let text_height = self.client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("Esplora height request failed: {}", e))?
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read height text: {}", e))?;
-
-        text_height.trim().parse::<u64>()
-            .map_err(|_| "Failed to parse block height integer".to_string())
+        raw_text.trim().parse::<u64>()
+            .map_err(|_| "Failed to parse block height integer from quorum responses".to_string())
     }
 
     // --- BATCHED WATCHING METHODS ---
-
     fn register_payment(&self, watch: PaymentWatch) {
         if let Ok(mut pending) = self.pending.lock() {
             println!("EsploraNetwork::register_payment for invoice: {}", watch.invoice_id);
@@ -226,10 +285,9 @@ impl NetworkClient for EsploraNetwork {
     }
 
     async fn watch_payments(&self) -> Result<(), String> {
-        println!("EsploraNetwork::watch_payments processing loop started on {}", self.api_url);
+        println!("EsploraNetwork::watch_payments processing loop started with {} endpoints", self.api_urls.len());
 
         loop {
-            // Take a short-lived lock snapshot to isolate thread access
             let current_watches: Vec<PaymentWatch> = match self.pending.lock() {
                 Ok(p) => p.values().cloned().collect(),
                 Err(_) => return Err("Pending payments lock poisoned".to_string()),
@@ -239,15 +297,13 @@ impl NetworkClient for EsploraNetwork {
                 let mut completed_invoices = Vec::new();
 
                 for watch in current_watches {
-                    // target_amount is already stored in absolute Satoshis (u128)
                     let target_satoshis = watch.target_amount;
-                    let txs_url = format!("{}/address/{}/txs", self.api_url, watch.address);
+                    let path = format!("/address/{}/txs", watch.address);
 
-                    let res = self.client.get(&txs_url).send().await;
-                    if let Ok(response) = res {
-                        if let Ok(txs) = response.json::<Vec<EsploraTx>>().await {
+                    // Query the API using the engine's built-in multi-endpoint quorum structure
+                    if let Ok(raw_json) = self.request_api(&path).await {
+                        if let Ok(txs) = serde_json::from_str::<Vec<EsploraTx>>(&raw_json) {
 
-                            // Scan UTXO vector for matching destination criteria
                             let matching_tx = txs.iter().find(|tx| {
                                 tx.vout.iter().any(|out| {
                                     out.scriptpubkey_address.as_deref() == Some(&watch.address)
@@ -285,13 +341,11 @@ impl NetworkClient for EsploraNetwork {
                     }
                 }
 
-                // Clean up entries that achieved total settlement
                 for id in completed_invoices {
                     self.unregister_payment(id);
                 }
             }
 
-            // Polling frequency adapted for Bitcoin block intervals
             sleep(Duration::from_secs(30)).await;
         }
     }

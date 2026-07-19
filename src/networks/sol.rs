@@ -1,4 +1,4 @@
-use super::{Amount, NetworkClient, PaymentWatch};
+use super::{Amount, NetworkClient, PaymentWatch, SolanaCluster};
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -10,8 +10,8 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 use ed25519_dalek::SigningKey;
-use hmac::{Hmac, Mac};
-use sha2::Sha512;
+use hmac::{Hmac, KeyInit, Mac}; // Added KeyInit here
+use sha2::{Sha256, Sha512, Digest};
 use sqlx::PgPool;
 
 // ==========================================
@@ -50,19 +50,35 @@ struct SolTokenAccountsValue {
 // ### NETWORK IMPLEMENTATION ###
 // ==========================================
 pub struct SolanaNetwork {
-    rpc_url: String,
-    network_name: String,
+    rpc_urls: Vec<String>,
+    pub network_name: String,
     client: reqwest::Client,
     pending: Mutex<HashMap<Uuid, PaymentWatch>>,
 }
 
 impl SolanaNetwork {
-    /// Generic RPC helper to handle different Solana JSON-RPC response shapes cleanly
-    async fn call_rpc<T: serde::de::DeserializeOwned>(
+    /// Constructor matching the NetworkRegistry initialization signature
+    pub fn new(cluster: SolanaCluster, rpc_urls: Vec<String>) -> Self {
+        assert!(!rpc_urls.is_empty(), "SolanaNetwork requires at least one RPC URL");
+
+        // Dynamically creates names like "SOL_MainnetBeta", "SOL_Devnet", etc.
+        let network_name = format!("SOL_{:?}", cluster);
+
+        Self {
+            rpc_urls,
+            network_name,
+            client: reqwest::Client::new(),
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Single RPC helper returning a raw JSON Value to allow safe variant comparison during Quorum checks
+    async fn call_rpc_single(
         &self,
+        url: &str,
         method: &'static str,
-        params: serde_json::Value,
-    ) -> Result<T, String> {
+        params: serde_json::Value
+    ) -> Result<serde_json::Value, String> {
         let payload = RpcRequest {
             jsonrpc: "2.0",
             method,
@@ -71,22 +87,70 @@ impl SolanaNetwork {
         };
 
         let response = self.client
-            .post(&self.rpc_url)
+            .post(url)
             .json(&payload)
             .send()
             .await
-            .map_err(|e| format!("HTTP Request failed: {}", e))?;
+            .map_err(|e| format!("HTTP Request failed to {url}: {e}"))?;
 
-        let rpc_res: RpcResponse<T> = response
+        let rpc_res: RpcResponse<serde_json::Value> = response
             .json()
             .await
-            .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
+            .map_err(|e| format!("Failed to parse JSON response from {url}: {e}"))?;
 
         if let Some(err) = rpc_res.error {
-            return Err(format!("RPC Error: {}", err.message));
+            return Err(format!("RPC Error from {url}: {}", err.message));
         }
 
-        rpc_res.result.ok_or_else(|| "No result found in RPC response".to_string())
+        rpc_res.result.ok_or_else(|| format!("No result found in RPC response from {url}"))
+    }
+
+    /// Fans out to all Solana endpoints and enforces a 2-node agreement quorum.
+    /// Deserializes into the target type T only after consensus is established.
+    async fn call_rpc<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> Result<T, String> {
+        // Fast path for single-endpoint configurations (e.g., local test/dev nodes)
+        if self.rpc_urls.len() == 1 {
+            let raw_val = self.call_rpc_single(&self.rpc_urls[0], method, params).await?;
+            return serde_json::from_value(raw_val)
+                .map_err(|e| format!("Failed to deserialize response: {e}"));
+        }
+
+        let futures = self.rpc_urls.iter()
+            .map(|url| self.call_rpc_single(url, method, params.clone()));
+        let results: Vec<Result<serde_json::Value, String>> = futures::future::join_all(futures).await;
+
+        let oks: Vec<&serde_json::Value> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+
+        if oks.len() < 2 {
+            let errs: Vec<&String> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+            return Err(format!(
+                "Quorum failed for {method} on network {}: only {}/{} endpoints responded. Errors: {:?}",
+                self.network_name, oks.len(), self.rpc_urls.len(), errs
+            ));
+        }
+
+        // Identify the first value agreed upon by at least 2 distinct endpoints
+        let mut quorum_winner = None;
+        for candidate in &oks {
+            if oks.iter().filter(|v| *v == candidate).count() >= 2 {
+                quorum_winner = Some(*candidate);
+                break;
+            }
+        }
+
+        if let Some(winner) = quorum_winner {
+            serde_json::from_value(winner.clone())
+                .map_err(|e| format!("Failed to deserialize quorum-verified JSON response: {e}"))
+        } else {
+            Err(format!(
+                "Quorum disagreement for {method} on network {}: endpoints returned mismatched state: {:?}",
+                self.network_name, oks
+            ))
+        }
     }
 
     pub fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
@@ -130,27 +194,31 @@ impl SolanaNetwork {
         Ok(bs58::encode(verifying_key.to_bytes()).into_string())
     }
 }
+pub fn derive_reference_bytes(invoice_id: Uuid) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(invoice_id.as_bytes());
+    hasher.finalize().into()
+}
 
 #[async_trait]
 impl NetworkClient for SolanaNetwork {
-    fn new(rpc_url: &str) -> Self {
-        let network_name = "SOL".to_string();
-        
-        Self {
-            rpc_url: rpc_url.to_string(),
-            network_name,
-            client: reqwest::Client::new(),
-            pending: Mutex::new(HashMap::new()),
-        }
-    }
-
     // --- WALLET METHODS ---
-    async fn get_derive_address(&self, pool: &PgPool, merchant_id: Uuid, mnemonic: &str ) -> Result<(String, u32), String> {
+    async fn get_derive_address(
+        &self,
+        _pool: &PgPool,
+        _merchant_id: Uuid,
+        invoice_id: Uuid,
+        mnemonic: &str,
+    ) -> Result<(String, u32, Option<String>), String> {
         // Solana is an account-based architecture, so like EVM, it does not suffer from UTXO address gaps.
-        // We safely default to index 0 for the merchant's deployment layout.
+        // Keeping your index 0 logic layout intact.
         let index = 0;
         let address = self.derive_address(mnemonic, index)?;
-        Ok((address, index))
+
+        let reference_bytes = crate::networks::evm::derive_reference_bytes(invoice_id);
+        let reference = format!("0x{}", hex::encode(reference_bytes));
+
+        Ok((address, index, Some(reference)))
     }
 
     fn get_derivation_path(&self, index: u32) -> String {
@@ -169,12 +237,10 @@ impl NetworkClient for SolanaNetwork {
     }
 
     // --- CHAIN STATE METHODS ---
-
     async fn get_native_balance(&self, address: &str) -> Result<Amount, String> {
         let params = json!([address]);
         let balance_info: SolBalanceValue = self.call_rpc("getBalance", params).await?;
 
-        // Native SOL RPC returns Lamports directly as a u64, safely convert to u128
         Ok(Amount(balance_info.value as u128))
     }
 
@@ -182,7 +248,7 @@ impl NetworkClient for SolanaNetwork {
         &self,
         token_address: &str,
         address: &str,
-        _decimals: u8, // Unused since we deal strictly in raw u128 atomic units now
+        _decimals: u8,
     ) -> Result<Amount, String> {
         let params = json!([
             address,
@@ -196,7 +262,6 @@ impl NetworkClient for SolanaNetwork {
             return Ok(Amount(0));
         }
 
-        // Safe extraction layer through Solana's heavily nested JSON structure
         let amount_str = response.value[0]
             .get("account")
             .and_then(|a| a.get("data"))
@@ -219,7 +284,6 @@ impl NetworkClient for SolanaNetwork {
     }
 
     // --- BATCHED WATCHING METHODS ---
-
     fn register_payment(&self, watch: PaymentWatch) {
         if let Ok(mut pending) = self.pending.lock() {
             println!("SolanaNetwork::register_payment for invoice: {}", watch.invoice_id);
@@ -235,22 +299,20 @@ impl NetworkClient for SolanaNetwork {
     }
 
     async fn watch_payments(&self) -> Result<(), String> {
-        println!("SolanaNetwork::watch_payments processing loop started on {}", self.rpc_url);
+        println!("SolanaNetwork::watch_payments processing loop started on endpoints: {:?}", self.rpc_urls);
 
         struct TrackingState {
-            target_balance: u128, // Changed from f64 to u128
+            target_balance: u128,
             detection_block: Option<u64>,
         }
         let mut tracking_registry: HashMap<Uuid, TrackingState> = HashMap::new();
 
         loop {
-            // Snapshot active watches under short lock
             let current_watches: Vec<PaymentWatch> = match self.pending.lock() {
                 Ok(p) => p.values().cloned().collect(),
                 Err(_) => return Err("Pending payments lock poisoned".to_string()),
             };
 
-            // Clean tracking register of components dropped externally
             tracking_registry.retain(|id, _| current_watches.iter().any(|w| w.invoice_id == *id));
 
             if !current_watches.is_empty() {
@@ -314,7 +376,6 @@ impl NetworkClient for SolanaNetwork {
                 }
             }
 
-            // Solana block times are fast, loop operates at a swift 2-second heartbeat
             sleep(Duration::from_secs(2)).await;
         }
     }
