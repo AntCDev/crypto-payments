@@ -177,9 +177,9 @@ impl NetworkClient for EVMNetwork {
     ) -> Result<(String, u32, Option<String>), String> {
         let row = sqlx::query!(
             r#"
-            INSERT INTO merchant_network_indices (merchant_id, network, next_index)
-            VALUES ($1, $2, 1)
-            ON CONFLICT (merchant_id, network)
+            INSERT INTO merchant_network_indices (merchant_id, network, account_index, next_index)
+            VALUES ($1, $2, 0, 1)
+            ON CONFLICT (merchant_id, network, account_index)
             DO UPDATE SET
                 next_index = merchant_network_indices.next_index + 1,
                 updated_at = CURRENT_TIMESTAMP

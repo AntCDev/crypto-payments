@@ -9,9 +9,15 @@ use uuid::Uuid;
 use chrono::{Utc, Duration};
 
 pub fn register(registry: &mut TokenRegistry, networks: Arc<NetworkRegistry>) {
-    let handler = BaseHandler {
-        network: networks.evm_chain(8453), // Base mainnet
+    let network = match networks.evm_chain(8453) {
+        Some(net) => net,
+        None => {
+            println!("  ❌ USDC_BASE - USD Coin (Base) - Skipped (Base network / chain_id 8453 not configured)");
+            return;
+        }
     };
+
+    let handler = BaseHandler { network };
 
     registry.register_token(
         "USDC_BASE",

@@ -9,13 +9,11 @@ pub mod evm;
 pub mod sol;
 pub mod esplora;
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SolanaCluster {
     MainnetBeta,
     Testnet,
     Devnet,
-    // Localnet omitted from prod registry; add if you spin up test validators in CI
 }
 
 impl SolanaCluster {
@@ -26,20 +24,13 @@ impl SolanaCluster {
             SolanaCluster::Devnet => "SOLANA_DEVNET_RPC_URLS",
         }
     }
-
-    /// Mainnet is required in every deployment; testnet/devnet are optional
-    /// (only needed if you're actually accepting payments there, e.g. staging).
-    fn required(&self) -> bool {
-        matches!(self, SolanaCluster::MainnetBeta)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BitcoinNetwork {
     Mainnet,
-    Testnet4, // testnet3 is being deprecated by most Esplora operators; prefer testnet4
+    Testnet4,
     Signet,
-    // Regtest omitted from prod registry; useful for local/CI only
 }
 
 impl BitcoinNetwork {
@@ -50,13 +41,7 @@ impl BitcoinNetwork {
             BitcoinNetwork::Signet => "ESPLORA_SIGNET_URLS",
         }
     }
-
-    fn required(&self) -> bool {
-        matches!(self, BitcoinNetwork::Mainnet)
-    }
 }
-
-
 
 #[derive(Clone)]
 pub struct NetworkRegistry {
@@ -67,73 +52,69 @@ pub struct NetworkRegistry {
 
 impl NetworkRegistry {
     pub fn from_env() -> Self {
-        // ETH_MAINNET_RPC_URLS="https://a,https://b,https://c" -> Vec<String>
-        fn urls_from_env(key: &str) -> Vec<String> {
-            let raw = std::env::var(key)
-                .unwrap_or_else(|_| panic!("{key} environment variable must be set"));
-            let urls: Vec<String> = raw
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            assert!(!urls.is_empty(), "{key} must contain at least one URL");
-            urls
-        }
+        println!("\n🌐 Initializing Network Registry...");
 
-        // Same as above, but returns None if the var is simply unset —
-        // lets optional networks (testnet/devnet/signet) be skipped entirely.
-        fn urls_from_env_opt(key: &str) -> Option<Vec<String>> {
-            match std::env::var(key) {
-                Ok(raw) => {
-                    let urls: Vec<String> = raw
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    assert!(!urls.is_empty(), "{key} was set but contained no URLs");
-                    Some(urls)
-                }
-                Err(_) => None,
+        // Safely fetch URLs from env variables; treats empty strings ("") or missing variables as None
+        fn fetch_and_log_urls(name: &str, key: &str) -> Option<Vec<String>> {
+            let urls: Vec<String> = match std::env::var(key) {
+                Ok(raw) => raw
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+
+            if urls.is_empty() {
+                println!("  {} Network ❌ No valid RPC_URL found", name);
+                None
+            } else {
+                let count = urls.len();
+                let redundancy = if count > 1 { ", enabling redundancy" } else { "" };
+                println!("  {} Network ✅ {} RPC_URL Found{}", name, count, redundancy);
+                Some(urls)
             }
         }
 
         // ---- EVM ----
         let mut evm = HashMap::new();
-        evm.insert(1,     Arc::new(evm::EVMNetwork::new(1,     urls_from_env("ETH_MAINNET_RPC_URLS"))));
-        evm.insert(8453,  Arc::new(evm::EVMNetwork::new(8453,  urls_from_env("BASE_MAINNET_RPC_URLS"))));
-        evm.insert(137,   Arc::new(evm::EVMNetwork::new(137,   urls_from_env("POLYGON_MAINNET_RPC_URLS"))));
-        evm.insert(84532, Arc::new(evm::EVMNetwork::new(84532, urls_from_env("BASE_SEPOLIA_RPC_URLS"))));
+        let evm_configs = [
+            (1, "Ethereum", "ETH_MAINNET_RPC_URLS"),
+            (8453, "Base", "BASE_MAINNET_RPC_URLS"),
+            (137, "Polygon", "POLYGON_MAINNET_RPC_URLS"),
+            (84532, "Base Sepolia", "BASE_SEPOLIA_RPC_URLS"),
+        ];
+
+        for (chain_id, name, key) in evm_configs {
+            if let Some(urls) = fetch_and_log_urls(name, key) {
+                evm.insert(chain_id, Arc::new(evm::EVMNetwork::new(chain_id, urls)));
+            }
+        }
 
         // ---- Solana ----
         let mut sol = HashMap::new();
-        for cluster in [
-            SolanaCluster::MainnetBeta,
-            SolanaCluster::Testnet,
-            SolanaCluster::Devnet,
-        ] {
-            let urls = if cluster.required() {
-                Some(urls_from_env(cluster.env_prefix()))
-            } else {
-                urls_from_env_opt(cluster.env_prefix())
-            };
-            if let Some(urls) = urls {
+        let sol_configs = [
+            (SolanaCluster::MainnetBeta, "Solana Mainnet"),
+            (SolanaCluster::Testnet, "Solana Testnet"),
+            (SolanaCluster::Devnet, "Solana Devnet"),
+        ];
+
+        for (cluster, name) in sol_configs {
+            if let Some(urls) = fetch_and_log_urls(name, cluster.env_prefix()) {
                 sol.insert(cluster, Arc::new(sol::SolanaNetwork::new(cluster, urls)));
             }
         }
 
         // ---- Esplora (Bitcoin) ----
         let mut esplora = HashMap::new();
-        for network in [
-            BitcoinNetwork::Mainnet,
-            BitcoinNetwork::Testnet4,
-            BitcoinNetwork::Signet,
-        ] {
-            let urls = if network.required() {
-                Some(urls_from_env(network.env_prefix()))
-            } else {
-                urls_from_env_opt(network.env_prefix())
-            };
-            if let Some(urls) = urls {
+        let bitcoin_configs = [
+            (BitcoinNetwork::Mainnet, "Bitcoin Mainnet"),
+            (BitcoinNetwork::Testnet4, "Bitcoin Testnet4"),
+            (BitcoinNetwork::Signet, "Bitcoin Signet"),
+        ];
+
+        for (network, name) in bitcoin_configs {
+            if let Some(urls) = fetch_and_log_urls(name, network.env_prefix()) {
                 esplora.insert(network, Arc::new(esplora::EsploraNetwork::new(network, urls)));
             }
         }
@@ -141,26 +122,16 @@ impl NetworkRegistry {
         Self { evm, sol, esplora }
     }
 
-    /// Central lookup so token handlers never touch the HashMap directly.
-    pub fn evm_chain(&self, chain_id: u64) -> Arc<evm::EVMNetwork> {
-        self.evm
-            .get(&chain_id)
-            .cloned()
-            .unwrap_or_else(|| panic!("chain_id {chain_id} not configured in NetworkRegistry"))
+    pub fn evm_chain(&self, chain_id: u64) -> Option<Arc<evm::EVMNetwork>> {
+        self.evm.get(&chain_id).cloned()
     }
 
-    pub fn sol_cluster(&self, cluster: SolanaCluster) -> Arc<sol::SolanaNetwork> {
-        self.sol
-            .get(&cluster)
-            .cloned()
-            .unwrap_or_else(|| panic!("Solana cluster {cluster:?} not configured in NetworkRegistry"))
+    pub fn sol_cluster(&self, cluster: SolanaCluster) -> Option<Arc<sol::SolanaNetwork>> {
+        self.sol.get(&cluster).cloned()
     }
 
-    pub fn esplora_network(&self, network: BitcoinNetwork) -> Arc<esplora::EsploraNetwork> {
-        self.esplora
-            .get(&network)
-            .cloned()
-            .unwrap_or_else(|| panic!("Bitcoin network {network:?} not configured in NetworkRegistry"))
+    pub fn esplora_network(&self, network: BitcoinNetwork) -> Option<Arc<esplora::EsploraNetwork>> {
+        self.esplora.get(&network).cloned()
     }
 }
 

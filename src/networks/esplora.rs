@@ -186,12 +186,12 @@ impl NetworkClient for EsploraNetwork {
         invoice_id: Uuid,
         mnemonic: &str,
     ) -> Result<(String, u32, Option<String>), String> {
-        // Automatically tracks and increments the merchant's key index per specific BTC network
+        // Automatically tracks and increments the merchant's key index for account 0
         let row = sqlx::query!(
             r#"
-            INSERT INTO merchant_network_indices (merchant_id, network, next_index)
-            VALUES ($1, $2, 1)
-            ON CONFLICT (merchant_id, network)
+            INSERT INTO merchant_network_indices (merchant_id, network, account_index, next_index)
+            VALUES ($1, $2, 0, 1)
+            ON CONFLICT (merchant_id, network, account_index)
             DO UPDATE SET
                 next_index = merchant_network_indices.next_index + 1,
                 updated_at = CURRENT_TIMESTAMP
@@ -204,6 +204,7 @@ impl NetworkClient for EsploraNetwork {
             .await
             .map_err(|e| format!("Failed to update merchant network index: {}", e))?;
 
+        // Uses the newly generated index (row.next_index - 1 gives the zero-indexed key)
         let index = (row.next_index - 1) as u32;
         let address = self.derive_address(mnemonic, index)?;
 

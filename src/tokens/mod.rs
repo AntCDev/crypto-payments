@@ -54,6 +54,7 @@ pub struct TokenRegistry {
 impl TokenRegistry {
     /// Accepts the shared single-instance networks on initialization
     pub fn new(networks: Arc<NetworkRegistry>) -> Self {
+        println!("\n🪙 Registering Token Handlers...");
         let mut registry = Self {
             handlers: HashMap::new(),
             metadata: Vec::new(),
@@ -70,6 +71,12 @@ impl TokenRegistry {
     where
         H: TokenHandler + 'static,
     {
+        // Extract struct name from full type path (e.g. "my_app::tokens::eth::EthHandler" -> "EthHandler")
+        let full_type = std::any::type_name::<H>();
+        let handler_name = full_type.split("::").last().unwrap_or(full_type);
+
+        println!("  ✅ {} - {} - {} - {}", id, name, detail, handler_name);
+
         self.metadata.push(TokenMetadata {
             id: id.to_string(),
             name: name.to_string(),

@@ -8,10 +8,17 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use chrono::{Utc, Duration};
 
+
 pub fn register(registry: &mut TokenRegistry, networks: Arc<NetworkRegistry>) {
-    let handler = EthHandler {
-        network: networks.evm_chain(1), // Ethereum mainnet
+    let network = match networks.evm_chain(1) {
+        Some(net) => net,
+        None => {
+            println!("  ❌ USDC_ETH - USD Coin (Ethereum) - Skipped (Ethereum network / chain_id 1 not configured)");
+            return;
+        }
     };
+
+    let handler = EthHandler { network };
 
     registry.register_token(
         "USDC_ETH",
