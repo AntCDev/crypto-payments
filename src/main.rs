@@ -69,7 +69,11 @@ async fn initialize_database(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
             data TEXT,
             created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
             expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+            token_decimals SMALLINT,
+            network_type VARCHAR(20),
+            chain_ref VARCHAR(50),
         );
         "#
     )
@@ -194,6 +198,12 @@ async fn main() {
         .route("/api/tokens", get(api::watcher::list_tokens_handler))
         .route("/api/invoices", post(api::invoices::create_invoice_handler))
         .route("/api/merchants", post(api::merchants::signup_merchant_handler))
+
+        // Inspection / Test routes
+        .route("/api/test/tokens", get(api::tests::list_tokens_test_handler))
+        .route("/api/test/networks", get(api::tests::list_networks_test_handler))
+        .route("/api/test/merchants", get(api::tests::list_merchants_test_handler))
+        .route("/api/test/overview", get(api::tests::test_overview_handler))
 
         // Middleware
         .fallback_service(ServeDir::new("wwwroot"))

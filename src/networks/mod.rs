@@ -45,9 +45,9 @@ impl BitcoinNetwork {
 
 #[derive(Clone)]
 pub struct NetworkRegistry {
-    evm: HashMap<u64, Arc<evm::EVMNetwork>>,
-    sol: HashMap<SolanaCluster, Arc<sol::SolanaNetwork>>,
-    esplora: HashMap<BitcoinNetwork, Arc<esplora::EsploraNetwork>>,
+    pub(crate) evm: HashMap<u64, Arc<evm::EVMNetwork>>,
+    pub(crate) sol: HashMap<SolanaCluster, Arc<sol::SolanaNetwork>>,
+    pub(crate) esplora: HashMap<BitcoinNetwork, Arc<esplora::EsploraNetwork>>,
 }
 
 impl NetworkRegistry {

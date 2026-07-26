@@ -15,8 +15,7 @@ impl PaymentOrchestrator {
         Self { pool, registry }
     }
 
-    /// Handles complete database persistence and delegates key updates to token handlers
-    // Inside /orchestrator.rs -> PaymentOrchestrator::create_invoice
+    // Handles complete database persistence and delegates key updates to token handlers
     pub async fn create_invoice(
         &self,
         merchant_id: Uuid,
