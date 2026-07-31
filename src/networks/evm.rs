@@ -69,6 +69,10 @@ struct BlockRecord {
 }
 
 
+
+
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tunables. All of these become per-merchant / per-chain config later.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,6 +83,104 @@ const MAX_REORG_DEPTH: u64 = 64;        // how far back we're willing to unwind
 
 const NETWORK_TYPE: &str = "evm";
 const SCAN_SCOPE_ADDRESSES: &str = "addresses";
+const SCAN_SCOPE_LOGS: &str = "logs";
+
+/// eth_getLogs range per request. Most providers cap somewhere between 1k and
+/// 10k blocks (and/or 10k results); 1000 is safe basically everywhere.
+/// TODO: per-provider config, and halve-and-retry on "response too large" errors.
+const MAX_LOG_BLOCK_RANGE: u64 = 1_000;
+
+/// ERC-20 invoice we're watching via contract Payment events. Wraps the plain
+/// WatchedInvoice so handle_reorg / refresh_confirmations / recompute_invoice_totals
+/// can be reused unchanged.
+#[derive(Clone)]
+struct WatchedTokenInvoice {
+    inner: WatchedInvoice,
+    /// The exact ERC-20 the invoice was issued in. A Payment event for the
+    /// right invoice id but the wrong token is NOT credited.
+    token_lc: String,
+}
+
+
+/// keccak256("Payment(address,address,bytes16,address,uint256,uint256,uint256)")
+/// Fallback if TOPIC_0 isn't set in the environment.
+const DEFAULT_PAYMENT_TOPIC0: &str =
+    "0x099d178f911e9b704ac40d2373ef01bce3f790aeca9723177c283461078bd70a";
+
+fn payment_topic0() -> &'static str {
+    static TOPIC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOPIC.get_or_init(|| {
+        std::env::var("TOPIC_0")
+            .unwrap_or_else(|_| DEFAULT_PAYMENT_TOPIC0.to_string())
+            .to_lowercase()
+    })
+}
+
+/// An indexed `address` topic is the address right-aligned in a 32-byte word.
+fn topic_to_address(topic: &str) -> Result<String, String> {
+    let h = topic.trim_start_matches("0x");
+    if h.len() != 64 {
+        return Err(format!("bad address topic '{topic}'"));
+    }
+    Ok(format!("0x{}", h[24..].to_lowercase()))
+}
+
+/// An indexed `bytes16` topic is LEFT-aligned (right-padded) in the 32-byte
+/// word — fixed-size bytesN are the opposite of address/uint alignment. The
+/// contract strips the dashes from a UUIDv4, so the first 16 bytes of the
+/// topic ARE the invoice UUID.
+fn topic_to_uuid(topic: &str) -> Result<Uuid, String> {
+    let h = topic.trim_start_matches("0x");
+    if h.len() != 64 {
+        return Err(format!("bad bytes16 topic '{topic}'"));
+    }
+    let bytes = hex::decode(&h[..32]).map_err(|e| format!("bad hex in topic '{topic}': {e}"))?;
+    Uuid::from_slice(&bytes).map_err(|e| format!("topic '{topic}' is not a UUID: {e}"))
+}
+
+/// Decoded CustodialPaymentVault.Payment event.
+struct PaymentEvent {
+    invoice_id: Uuid,
+    merchant_lc: String,
+    token_lc: String,
+    payer_lc: String,
+    amount_requested: u128,
+    /// What the vault ACTUALLY received (post fee-on-transfer). This is the
+    /// number we credit — mirrors the contract's own accounting.
+    amount_received: u128,
+}
+
+fn decode_payment_log(log: &Log) -> Result<PaymentEvent, String> {
+    if log.topics.len() != 4 {
+        return Err(format!(
+            "Payment log {} has {} topics, expected 4",
+            log.transaction_hash, log.topics.len()
+        ));
+    }
+
+    let merchant_lc = topic_to_address(&log.topics[1])?;
+    let token_lc = topic_to_address(&log.topics[2])?;
+    let invoice_id = topic_to_uuid(&log.topics[3])?;
+
+    // data = payer (32) | amountRequested (32) | amountReceived (32) | timestamp (32)
+    let d = log.data.trim_start_matches("0x");
+    if d.len() < 4 * 64 {
+        return Err(format!(
+            "Payment log {} data too short: {} hex chars",
+            log.transaction_hash, d.len()
+        ));
+    }
+    let word = |i: usize| &d[i * 64..(i + 1) * 64];
+
+    let payer_lc = format!("0x{}", word(0)[24..].to_lowercase());
+    // hex_to_u128 errors on anything above u128 — same ceiling as the rest of
+    // the money pipeline (see wei_to_decimal TODO about moving to u256).
+    let amount_requested = hex_to_u128(word(1))?;
+    let amount_received = hex_to_u128(word(2))?;
+
+    Ok(PaymentEvent { invoice_id, merchant_lc, token_lc, payer_lc, amount_requested, amount_received })
+}
+
 
 fn hex_to_u64(hex_str: &str) -> u64 {
     u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).unwrap_or(0)
@@ -221,7 +323,7 @@ impl EVMNetwork {
 
     // ── Scan state ───────────────────────────────────────────────────────────
 
-    async fn load_cursor(&self, pool: &PgPool) -> Result<Option<(i64, String)>, String> {
+    async fn load_cursor(&self, pool: &PgPool, scope: &str) -> Result<Option<(i64, String)>, String> {
         sqlx::query_as::<_, (i64, String)>(
             r#"
             SELECT last_block, last_block_hash
@@ -231,13 +333,13 @@ impl EVMNetwork {
         )
             .bind(NETWORK_TYPE)
             .bind(self.chain_ref())
-            .bind(SCAN_SCOPE_ADDRESSES)
+            .bind(scope)
             .fetch_optional(pool)
             .await
-            .map_err(|e| format!("load_cursor: {e}"))
+            .map_err(|e| format!("load_cursor({scope}): {e}"))
     }
 
-    async fn save_cursor(&self, pool: &PgPool, number: i64, hash: &str) -> Result<(), String> {
+    async fn save_cursor(&self, pool: &PgPool, scope: &str, number: i64, hash: &str) -> Result<(), String> {
         sqlx::query(
             r#"
             INSERT INTO network_scan_state
@@ -249,14 +351,14 @@ impl EVMNetwork {
                    updated_at = now()
             "#,
         )
-            .bind(NETWORK_TYPE).bind(self.chain_ref()).bind(SCAN_SCOPE_ADDRESSES)
+            .bind(NETWORK_TYPE).bind(self.chain_ref()).bind(scope)
             .bind(number).bind(hash)
             .execute(pool).await
-            .map_err(|e| format!("save_cursor: {e}"))?;
+            .map_err(|e| format!("save_cursor({scope}): {e}"))?;
         Ok(())
     }
 
-    async fn remember_block(&self, pool: &PgPool, b: &BlockView) -> Result<(), String> {
+    async fn remember_block(&self, pool: &PgPool, scope: &str, b: &BlockView) -> Result<(), String> {
         sqlx::query(
             r#"
             INSERT INTO network_seen_blocks
@@ -268,26 +370,26 @@ impl EVMNetwork {
                    seen_at = now()
             "#,
         )
-            .bind(NETWORK_TYPE).bind(self.chain_ref()).bind(SCAN_SCOPE_ADDRESSES)
+            .bind(NETWORK_TYPE).bind(self.chain_ref()).bind(scope)
             .bind(b.number as i64).bind(&b.hash).bind(&b.parent_hash)
             .execute(pool).await
-            .map_err(|e| format!("remember_block: {e}"))?;
+            .map_err(|e| format!("remember_block({scope}): {e}"))?;
         Ok(())
     }
 
-    async fn our_hash_at(&self, pool: &PgPool, number: i64) -> Result<Option<String>, String> {
+    async fn our_hash_at(&self, pool: &PgPool, scope: &str, number: i64) -> Result<Option<String>, String> {
         sqlx::query_scalar::<_, String>(
             r#"
             SELECT block_hash FROM network_seen_blocks
              WHERE network_type = $1 AND chain_ref = $2 AND scope = $3 AND block_number = $4
             "#,
         )
-            .bind(NETWORK_TYPE).bind(self.chain_ref()).bind(SCAN_SCOPE_ADDRESSES).bind(number)
+            .bind(NETWORK_TYPE).bind(self.chain_ref()).bind(scope).bind(number)
             .fetch_optional(pool).await
-            .map_err(|e| format!("our_hash_at: {e}"))
+            .map_err(|e| format!("our_hash_at({scope}): {e}"))
     }
 
-    async fn prune_seen_blocks(&self, pool: &PgPool, tip: i64) -> Result<(), String> {
+    async fn prune_seen_blocks(&self, pool: &PgPool, scope: &str, tip: i64) -> Result<(), String> {
         sqlx::query(
             r#"
             DELETE FROM network_seen_blocks
@@ -295,12 +397,13 @@ impl EVMNetwork {
                AND block_number < $4
             "#,
         )
-            .bind(NETWORK_TYPE).bind(self.chain_ref()).bind(SCAN_SCOPE_ADDRESSES)
+            .bind(NETWORK_TYPE).bind(self.chain_ref()).bind(scope)
             .bind(tip - (MAX_REORG_DEPTH as i64 * 2))
             .execute(pool).await
-            .map_err(|e| format!("prune_seen_blocks: {e}"))?;
+            .map_err(|e| format!("prune_seen_blocks({scope}): {e}"))?;
         Ok(())
     }
+
 
     // ── Who are we watching ──────────────────────────────────────────────────
 
@@ -387,7 +490,7 @@ impl EVMNetwork {
         }
 
         // 1. Where do we resume from?
-        let mut cursor = match self.load_cursor(pool).await? {
+        let mut cursor = match self.load_cursor(pool, SCAN_SCOPE_ADDRESSES).await? {
             Some((n, h)) => Some((n, h)),
             None => {
                 // Cold start. Begin at the oldest open invoice's creation block
@@ -431,9 +534,9 @@ impl EVMNetwork {
                             self.network_name, last_block, fork_point
                         );
                         self.handle_reorg(pool, fork_point, &watched).await?;
-                        let fork_hash = self.our_hash_at(pool, fork_point).await?.unwrap_or_default();
+                        let fork_hash = self.our_hash_at(pool, SCAN_SCOPE_ADDRESSES, fork_point).await?.unwrap_or_default();
                         cursor = Some((fork_point, fork_hash));
-                        self.save_cursor(pool, fork_point, &cursor.as_ref().unwrap().1).await?;
+                        self.save_cursor(pool, SCAN_SCOPE_ADDRESSES, fork_point, &cursor.as_ref().unwrap().1).await?;
                     }
                 }
             }
@@ -464,11 +567,11 @@ impl EVMNetwork {
             }
 
             self.apply_block(pool, &block, &by_address).await?;
-            self.remember_block(pool, &block).await?;
+            self.remember_block(pool, SCAN_SCOPE_ADDRESSES, &block).await?;
 
             last_hash = block.hash.clone();
             last_block = n;
-            self.save_cursor(pool, last_block, &last_hash).await?;
+            self.save_cursor(pool, SCAN_SCOPE_ADDRESSES, last_block, &last_hash).await?;
             n += 1;
         }
 
@@ -478,7 +581,7 @@ impl EVMNetwork {
         //    confirmation count instead of restarting from 0.
         self.refresh_confirmations(pool, tip, &watched).await?;
 
-        self.prune_seen_blocks(pool, last_block).await?;
+        self.prune_seen_blocks(pool, SCAN_SCOPE_ADDRESSES, last_block).await?;
         Ok(())
     }
 
@@ -501,7 +604,7 @@ impl EVMNetwork {
         let floor = (last_block - MAX_REORG_DEPTH as i64).max(0);
         let mut probe = last_block - 1;
         while probe >= floor {
-            let ours = match self.our_hash_at(pool, probe).await? {
+            let ours = match self.our_hash_at(pool, SCAN_SCOPE_ADDRESSES, probe).await? {
                 Some(h) => h,
                 // We never saw this block (pruned, or cold-started above it).
                 // Nothing older to compare — treat it as the fork point and
@@ -1204,19 +1307,374 @@ impl EVMNetwork {
         Ok(format!("0x{}", hex::encode(address_bytes)))
     }
 
+    /// ERC-20 invoices with an open interest on this chain. Mirror image of
+    /// load_watched_invoices: token_address IS NOT NULL means "paid through the
+    /// vault contract, matched by Payment logs", not by native transfers.
+    async fn load_watched_token_invoices(&self, pool: &PgPool) -> Result<Vec<WatchedTokenInvoice>, String> {
+        let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, rust_decimal::Decimal, i64, Option<i64>)>(
+            r#"
+            SELECT i.id,
+                   i.merchant_id,
+                   lower(i.wallet_address),
+                   lower(i.token_address),
+                   i.amount_requested,
+                   COALESCE(i.required_confirmations, $3)::bigint,
+                   i.created_block
+              FROM invoices i
+             WHERE i.network_type = $1
+               AND i.chain_ref  = $2
+               AND i.token_address IS NOT NULL
+               AND (
+                     (i.status = 'pending' AND i.expires_at > now())
+                  OR EXISTS (
+                        SELECT 1 FROM payments p
+                         WHERE p.invoice_id = i.id
+                           AND p.status IN ('detected', 'merchant_confirmed')
+                     )
+               )
+            "#,
+        )
+            .bind(NETWORK_TYPE)
+            .bind(self.chain_ref())
+            .bind(FINAL_CONFIRMATIONS)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("load_watched_token_invoices: {e}"))?;
+
+        Ok(rows.into_iter().map(|(invoice_id, merchant_id, address_lc, token_lc, amount_requested, required_confirmations, created_block)| {
+            WatchedTokenInvoice {
+                inner: WatchedInvoice {
+                    invoice_id, merchant_id, address_lc,
+                    amount_requested, required_confirmations, created_block,
+                },
+                token_lc,
+            }
+        }).collect())
+    }
+
+    /// Fork detection for a SPARSE history. The logs scanner only anchors one
+    /// header per getLogs chunk, so unlike detect_fork_point we can't demand a
+    /// remembered hash at every height — we walk back through the anchors we
+    /// actually have and find the highest one still canonical.
+    async fn detect_fork_point_sparse(
+        &self,
+        pool: &PgPool,
+        scope: &str,
+        last_block: i64,
+        last_hash: &str,
+    ) -> Result<Option<i64>, String> {
+        // Fast path: cursor block still canonical => no reorg.
+        if let Some(b) = self.get_block(last_block as u64, false).await? {
+            if b.hash == last_hash {
+                return Ok(None);
+            }
+        }
+
+        let floor = (last_block - MAX_REORG_DEPTH as i64).max(0);
+
+        let anchors = sqlx::query_as::<_, (i64, String)>(
+            r#"
+            SELECT block_number, block_hash FROM network_seen_blocks
+             WHERE network_type = $1 AND chain_ref = $2 AND scope = $3
+               AND block_number < $4 AND block_number >= $5
+             ORDER BY block_number DESC
+            "#,
+        )
+            .bind(NETWORK_TYPE).bind(self.chain_ref()).bind(scope)
+            .bind(last_block).bind(floor)
+            .fetch_all(pool).await
+            .map_err(|e| format!("detect_fork_point_sparse({scope}): {e}"))?;
+
+        for (n, ours) in anchors {
+            match self.get_block(n as u64, false).await? {
+                Some(b) if b.hash == ours => return Ok(Some(n)),
+                _ => continue,
+            }
+        }
+
+        // No surviving anchor within the window. Same posture as the dense
+        // detector: clamp and rescan; TODO raise an operational alert instead.
+        eprintln!(
+            "[{}] {} reorg deeper than MAX_REORG_DEPTH ({} blocks) — clamping to {}",
+            self.network_name, scope, MAX_REORG_DEPTH, floor
+        );
+        Ok(Some(floor))
+    }
+
+    /// Apply one decoded-able Payment log. Idempotent for the same reasons as
+    /// apply_block: unique index on (invoice_id, tx_hash) makes rescans and
+    /// crash-replays no-ops.
+    async fn apply_payment_log(
+        &self,
+        pool: &PgPool,
+        log: &Log,
+        by_id: &HashMap<Uuid, WatchedTokenInvoice>,
+    ) -> Result<(), String> {
+        if log.removed {
+            return Ok(()); // reorg-removed entry from a lagging provider; reorg path owns this
+        }
+
+        let ev = match decode_payment_log(log) {
+            Ok(ev) => ev,
+            Err(e) => {
+                // Someone else's event that happens to share topic0, or a
+                // malformed identifier. Not our invoice, not our problem.
+                eprintln!("[{}] skipping undecodable Payment log {}: {e}", self.network_name, log.transaction_hash);
+                return Ok(());
+            }
+        };
+
+        let Some(w) = by_id.get(&ev.invoice_id) else {
+            return Ok(()); // not an invoice we're watching (settled, expired, other env)
+        };
+        let inv = &w.inner;
+
+        // Defense in depth: the identifier alone is attacker-suppliable calldata.
+        // The money only counts if it's the right token credited to the right
+        // merchant wallet — both of which the contract guarantees in the event.
+        if w.token_lc != ev.token_lc {
+            eprintln!(
+                "[{}] Payment log for invoice {} has wrong token {} (expected {}), ignoring",
+                self.network_name, ev.invoice_id, ev.token_lc, w.token_lc
+            );
+            return Ok(());
+        }
+        if inv.address_lc != ev.merchant_lc {
+            eprintln!(
+                "[{}] Payment log for invoice {} credits wrong merchant {} (expected {}), ignoring",
+                self.network_name, ev.invoice_id, ev.merchant_lc, inv.address_lc
+            );
+            return Ok(());
+        }
+
+        let block_number = hex_to_u64(&log.block_number) as i64;
+        let block_hash = log.block_hash.to_lowercase();
+        let tx_hash = log.transaction_hash.to_lowercase();
+
+        if let Some(created) = inv.created_block {
+            if block_number < created {
+                return Ok(()); // predates the invoice, not our money
+            }
+        }
+
+        // Credit amountReceived, not amountRequested — matches the vault's own
+        // fee-on-transfer-safe accounting. recompute_invoice_totals will land
+        // the invoice on paid/underpaid/overpaid accordingly.
+        let amount = wei_to_decimal(ev.amount_received)?;
+
+        // TODO: (invoice_id, tx_hash) uniqueness collapses two Payment events
+        //     for the SAME invoice inside the SAME tx (e.g. a batching router)
+        //     into one credit. Needs log_index in the unique key to support that.
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO payments
+                (invoice_id, tx_hash, amount, block_number, block_hash, confirmations, status)
+            VALUES ($1, $2, $3, $4, $5, 0, 'detected')
+            ON CONFLICT (invoice_id, tx_hash) DO NOTHING
+            "#,
+        )
+            .bind(inv.invoice_id)
+            .bind(&tx_hash)
+            .bind(amount)
+            .bind(block_number)
+            .bind(&block_hash)
+            .execute(pool).await
+            .map_err(|e| format!("insert token payment: {e}"))?
+            .rows_affected() == 1;
+
+        if inserted {
+            println!(
+                "[{}] detected {} base units of {} -> merchant {} from {} (invoice {}, tx {}, block {})",
+                self.network_name, ev.amount_received, ev.token_lc, ev.merchant_lc,
+                ev.payer_lc, inv.invoice_id, tx_hash, block_number
+            );
+            if ev.amount_received != ev.amount_requested {
+                println!(
+                    "[{}] note: fee-on-transfer delta on invoice {}: requested {} received {}",
+                    self.network_name, inv.invoice_id, ev.amount_requested, ev.amount_received
+                );
+            }
+
+            // ── WEBHOOK ───────────────────────────────────────────────────────
+            // First sighting of this tx for this invoice. Register
+            // 'payment.detected' for merchant `inv.merchant_id` / invoice
+            // `inv.invoice_id` with token, tx_hash, payer, base-unit amount
+            // (amount_received), block_number, block_hash, confirmations = 0.
+            // Same exactly-once guarantee as the native path: the unique index
+            // is the latch, so the webhook row belongs in the SAME db tx.
+            // TODO: wrap payment-insert + webhook-insert in one tx.
+            // ──────────────────────────────────────────────────────────────────
+        } else {
+            // Already known — rescan, or re-mined post-reorg. Refresh location,
+            // never the amount.
+            sqlx::query(
+                r#"
+                UPDATE payments
+                   SET block_number = $2, block_hash = $3,
+                       status = CASE WHEN status = 'orphaned' THEN 'detected' ELSE status END,
+                       updated_at = now()
+                 WHERE invoice_id = $1 AND tx_hash = $4
+                   AND (block_hash <> $3 OR status = 'orphaned')
+                "#,
+            )
+                .bind(inv.invoice_id)
+                .bind(block_number)
+                .bind(&block_hash)
+                .bind(&tx_hash)
+                .execute(pool).await
+                .map_err(|e| format!("relocate token payment: {e}"))?;
+        }
+
+        self.recompute_invoice_totals(pool, inv.invoice_id, std::slice::from_ref(inv)).await?;
+        Ok(())
+    }
+
     pub async fn watch_logs(&self, pool: &PgPool) -> Result<(), String> {
+        let Some(contract) = self.contract_address.as_deref() else {
+            // e.g. POLYGON_MAINNET_CONTRACT_ADDRESS="" — vault not deployed
+            // here (yet). Native watching still runs; there's just no contract
+            // to watch, so exit instead of spinning.
+            println!(
+                "EVMNetwork::watch_logs: no contract address for {} ({}), service not started",
+                self.network_name, self.chain_id
+            );
+            return Ok(());
+        };
+        let contract_lc = contract.to_lowercase();
+
         println!(
-            "EVMNetwork::watch_logs service started for {} ({})",
-            self.network_name, self.chain_id
+            "EVMNetwork::watch_logs service started for {} ({}) on vault {} topic0 {}",
+            self.network_name, self.chain_id, contract_lc, payment_topic0()
         );
 
         loop {
-            // TODO: Add event/log-watching logic here
-            println!("EVMNetwork::watch_logs tick [{}]", self.network_name);
-
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            if let Err(e) = self.tick_logs(pool, &contract_lc).await {
+                // Same posture as watch_addresses: cursor only advances on
+                // success, so failures are safe to just retry next tick.
+                eprintln!(
+                    "EVMNetwork::watch_logs tick failed [{}]: {e}",
+                    self.network_name
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
         }
     }
+
+    async fn tick_logs(&self, pool: &PgPool, contract_lc: &str) -> Result<(), String> {
+        let watched = self.load_watched_token_invoices(pool).await?;
+        // Plain view for the shared machinery (reorg unwind, confirmations, totals).
+        let watched_plain: Vec<WatchedInvoice> = watched.iter().map(|w| w.inner.clone()).collect();
+        // Payment logs carry the invoice UUID natively (bytes16 identifier), so
+        // unlike the address scanner this map is keyed by id — no multimap needed.
+        let by_id: HashMap<Uuid, WatchedTokenInvoice> = watched.iter()
+            .map(|w| (w.inner.invoice_id, w.clone()))
+            .collect();
+
+        let tip = self.get_block_number().await? as i64;
+
+        // 1. Where do we resume from?
+        let cursor = match self.load_cursor(pool, SCAN_SCOPE_LOGS).await? {
+            Some(c) => Some(c),
+            None => {
+                let start = sqlx::query_scalar::<_, Option<i64>>(
+                    r#"
+                    SELECT MIN(i.created_block)
+                      FROM invoices i
+                     WHERE i.network_type = $1 AND i.chain_ref = $2
+                       AND i.token_address IS NOT NULL
+                       AND (
+                             (i.status = 'pending' AND i.expires_at > now())
+                          OR EXISTS (SELECT 1 FROM payments p
+                                      WHERE p.invoice_id = i.id
+                                        AND p.status IN ('detected','merchant_confirmed'))
+                       )
+                    "#,
+                )
+                    .bind(NETWORK_TYPE).bind(self.chain_ref())
+                    .fetch_one(pool).await
+                    .map_err(|e| format!("logs cold start floor: {e}"))?
+                    .unwrap_or(tip);
+
+                let from = (start - 1).max(0);
+                println!(
+                    "[{}] no logs scan cursor, cold-starting at block {}",
+                    self.network_name, from + 1
+                );
+                Some((from, String::new()))
+            }
+        };
+
+        // 2. Reorg check + unwind, before applying anything new.
+        let mut cursor = cursor;
+        if let Some((last_block, last_hash)) = cursor.clone() {
+            if !last_hash.is_empty() {
+                if let Some(fork_point) = self
+                    .detect_fork_point_sparse(pool, SCAN_SCOPE_LOGS, last_block, &last_hash)
+                    .await?
+                {
+                    if fork_point < last_block {
+                        println!(
+                            "[{}] logs reorg detected: cursor was {}, rewinding to {}",
+                            self.network_name, last_block, fork_point
+                        );
+                        self.handle_reorg(pool, fork_point, &watched_plain).await?;
+                        let fork_hash = self
+                            .our_hash_at(pool, SCAN_SCOPE_LOGS, fork_point)
+                            .await?
+                            .unwrap_or_default();
+                        self.save_cursor(pool, SCAN_SCOPE_LOGS, fork_point, &fork_hash).await?;
+                        cursor = Some((fork_point, fork_hash));
+                    }
+                }
+            }
+        }
+
+        let (mut last_block, _) = cursor.unwrap();
+
+        // 3. Batched log search. Same per-tick budget as the address scanner so
+        //  catch-up after downtime is spread over multiple ticks, split into
+        //  provider-friendly getLogs ranges.
+        let target = std::cmp::min(tip, last_block + MAX_BLOCKS_PER_TICK as i64);
+
+        let mut from = last_block + 1;
+        while from <= target {
+            let to = std::cmp::min(from + MAX_LOG_BLOCK_RANGE as i64 - 1, target);
+
+            let filter = serde_json::json!({
+                "address": contract_lc,
+                "topics": [payment_topic0()],
+                "fromBlock": format!("0x{:x}", from),
+                "toBlock": format!("0x{:x}", to),
+            });
+            let logs = self.get_logs(filter).await?;
+
+            // Anchor: the header of the chunk's last block. This is what the
+            // sparse fork detector compares against next tick. Fetched AFTER
+            // the logs on purpose — if a reorg lands between the two calls,
+            // the anchor won't match canonical next tick and we rewind/rescan.
+            let anchor = match self.get_block(to as u64, false).await? {
+                Some(b) => b,
+                None => break, // provider lagging the tip; retry next tick
+            };
+
+            for log in &logs {
+                self.apply_payment_log(pool, log, &by_id).await?;
+            }
+
+            self.remember_block(pool, SCAN_SCOPE_LOGS, &anchor).await?;
+            self.save_cursor(pool, SCAN_SCOPE_LOGS, to, &anchor.hash).await?;
+            last_block = to;
+            from = to + 1;
+        }
+
+        // 4. Confirmations off the DB against the current tip — identical
+        //  machinery to the native path, payments rows are payments rows.
+        self.refresh_confirmations(pool, tip, &watched_plain).await?;
+
+        self.prune_seen_blocks(pool, SCAN_SCOPE_LOGS, last_block).await?;
+        Ok(())
+    }
+
 }
 
 #[async_trait]
