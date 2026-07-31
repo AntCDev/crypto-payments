@@ -194,11 +194,6 @@ impl SolanaNetwork {
         Ok(bs58::encode(verifying_key.to_bytes()).into_string())
     }
 }
-pub fn derive_reference_bytes(invoice_id: Uuid) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(invoice_id.as_bytes());
-    hasher.finalize().into()
-}
 
 #[async_trait]
 impl NetworkClient for SolanaNetwork {
@@ -215,8 +210,7 @@ impl NetworkClient for SolanaNetwork {
         let index = 0;
         let address = self.derive_address(mnemonic, index)?;
 
-        let reference_bytes = crate::networks::evm::derive_reference_bytes(invoice_id);
-        let reference = format!("0x{}", hex::encode(reference_bytes));
+        let reference = format!("0x{}", hex::encode(invoice_id.as_bytes()));
 
         Ok((address, index, Some(reference)))
     }
@@ -298,7 +292,7 @@ impl NetworkClient for SolanaNetwork {
         }
     }
 
-    async fn watch_payments(&self) -> Result<(), String> {
+    async fn watch_payments(&self, pool: &PgPool) -> Result<(), String> {
         println!("SolanaNetwork::watch_payments processing loop started on endpoints: {:?}", self.rpc_urls);
 
         struct TrackingState {

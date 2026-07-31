@@ -59,6 +59,7 @@ async fn initialize_database(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
             token_id VARCHAR(100) NOT NULL,
+            token_address VARCHAR(255),
             amount_requested NUMERIC(78, 0) NOT NULL,
             amount_received NUMERIC(78, 0) NOT NULL DEFAULT 0,
             wallet_address VARCHAR(255) NOT NULL,
@@ -70,10 +71,11 @@ async fn initialize_database(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
             created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
             expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
             updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
+            created_block BIGINT,
+            required_confirmations SMALLINT,
             token_decimals SMALLINT,
             network_type VARCHAR(20),
-            chain_ref VARCHAR(50),
+            chain_ref VARCHAR(50)
         );
         "#
     )
@@ -99,6 +101,15 @@ async fn initialize_database(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     )
         .execute(pool)
         .await?;
+
+    // 3b. Payments needs a uniqueness guarantee so detection is idempotent across restarts.
+    sqlx::query(
+        r#"
+    CREATE UNIQUE INDEX IF NOT EXISTS payments_invoice_tx_uniq
+        ON payments (invoice_id, tx_hash);
+    "#
+    ).execute(pool).await?;
+
 
     // 4. Create Merchant Key Material Table
     sqlx::query(
@@ -129,9 +140,9 @@ async fn initialize_database(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         r#"
         CREATE TABLE IF NOT EXISTS merchant_network_indices (
             merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
-            network VARCHAR(50) NOT NULL,       -- 'EVM', 'SOL', 'ESPLORA', future 'TRON'...
+            network VARCHAR(50) NOT NULL,
             account_index INT NOT NULL DEFAULT 0,
-            next_index INT NOT NULL DEFAULT 0,
+            next_index INT NOT NULL DEFAULT 1, -- Set default to 1
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (merchant_id, network, account_index)
         );
@@ -139,6 +150,38 @@ async fn initialize_database(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     )
         .execute(pool)
         .await?;
+
+    // 6. Per-chain scan cursor. This is what makes watch_addresses restart-safe:
+    //    we never rely on `self.pending` for "where was I", only for "who do I care about".
+    sqlx::query(
+        r#"
+    CREATE TABLE IF NOT EXISTS network_scan_state (
+        network_type      VARCHAR(20) NOT NULL,
+        chain_ref         VARCHAR(50) NOT NULL,
+        scope             VARCHAR(20) NOT NULL, -- 'addresses' | 'logs'
+        last_block        BIGINT NOT NULL,
+        last_block_hash   VARCHAR(255) NOT NULL,
+        updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (network_type, chain_ref, scope)
+    );
+    "#
+    ).execute(pool).await?;
+
+    // 7. The scan cursor tells us "where was I", this tells us "what did I think the chain looked like".
+    sqlx::query(
+        r#"
+    CREATE TABLE IF NOT EXISTS network_seen_blocks (
+        network_type  VARCHAR(20) NOT NULL,
+        chain_ref     VARCHAR(50) NOT NULL,
+        scope         VARCHAR(20) NOT NULL,
+        block_number  BIGINT      NOT NULL,
+        block_hash    VARCHAR(255) NOT NULL,
+        parent_hash   VARCHAR(255) NOT NULL,
+        seen_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (network_type, chain_ref, scope, block_number)
+    );
+    "#
+    ).execute(pool).await?;
 
     println!("Database tables initialized successfully (or already exist).");
     Ok(())

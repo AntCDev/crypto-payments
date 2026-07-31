@@ -54,7 +54,7 @@ impl NetworkRegistry {
     pub fn from_env() -> Self {
         println!("\n🌐 Initializing Network Registry...");
 
-        // Safely fetch URLs from env variables; treats empty strings ("") or missing variables as None
+        // Safely fetch multi-URL strings (RPCs)
         fn fetch_and_log_urls(name: &str, key: &str) -> Option<Vec<String>> {
             let urls: Vec<String> = match std::env::var(key) {
                 Ok(raw) => raw
@@ -76,18 +76,38 @@ impl NetworkRegistry {
             }
         }
 
+        // Helper to fetch single optional strings (like contract addresses)
+        fn fetch_optional_env(key: &str) -> Option<String> {
+            std::env::var(key)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        }
+
         // ---- EVM ----
         let mut evm = HashMap::new();
+        // Tuple format: (Chain ID, Network Name, RPC Env Key, Contract Env Key)
         let evm_configs = [
-            (1, "Ethereum", "ETH_MAINNET_RPC_URLS"),
-            (8453, "Base", "BASE_MAINNET_RPC_URLS"),
-            (137, "Polygon", "POLYGON_MAINNET_RPC_URLS"),
-            (84532, "Base Sepolia", "BASE_SEPOLIA_RPC_URLS"),
+            (1, "Ethereum", "ETH_MAINNET_RPC_URLS", "ETH_MAINNET_CONTRACT_ADDRESS"),
+            (8453, "Base", "BASE_MAINNET_RPC_URLS", "BASE_MAINNET_CONTRACT_ADDRESS"),
+            (137, "Polygon", "POLYGON_MAINNET_RPC_URLS", "POLYGON_MAINNET_CONTRACT_ADDRESS"),
+            (84532, "Base Sepolia", "BASE_SEPOLIA_RPC_URLS", "BASE_SEPOLIA_CONTRACT_ADDRESS"),
         ];
 
-        for (chain_id, name, key) in evm_configs {
-            if let Some(urls) = fetch_and_log_urls(name, key) {
-                evm.insert(chain_id, Arc::new(evm::EVMNetwork::new(chain_id, urls)));
+        for (chain_id, name, rpc_key, contract_key) in evm_configs {
+            if let Some(urls) = fetch_and_log_urls(name, rpc_key) {
+                let contract_address = fetch_optional_env(contract_key);
+
+                if let Some(ref addr) = contract_address {
+                    println!("    └─ Contract Address: {}", addr);
+                } else {
+                    println!("    └─ Contract Address: ⚠️ None configured");
+                }
+
+                evm.insert(
+                    chain_id,
+                    Arc::new(evm::EVMNetwork::new(chain_id, urls, contract_address))
+                );
             }
         }
 
@@ -159,5 +179,5 @@ pub trait NetworkClient: Send + Sync {
     async fn get_current_block(&self) -> Result<u64, String>;
     fn register_payment(&self, watch: PaymentWatch);
     fn unregister_payment(&self, invoice_id: Uuid);
-    async fn watch_payments(&self) -> Result<(), String>;
+    async fn watch_payments(&self, pool: &PgPool) -> Result<(), String>;
 }

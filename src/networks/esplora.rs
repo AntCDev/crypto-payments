@@ -171,11 +171,6 @@ impl EsploraNetwork {
         Ok(address)
     }
 }
-pub fn derive_reference_bytes(invoice_id: Uuid) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(invoice_id.as_bytes());
-    hasher.finalize().into()
-}
 #[async_trait]
 impl NetworkClient for EsploraNetwork {
     // --- WALLET METHODS ---
@@ -209,8 +204,7 @@ impl NetworkClient for EsploraNetwork {
         let address = self.derive_address(mnemonic, index)?;
 
         // Keeping tracking references uniform across your processing layer
-        let reference_bytes = crate::networks::evm::derive_reference_bytes(invoice_id);
-        let reference = format!("0x{}", hex::encode(reference_bytes));
+        let reference = format!("0x{}", hex::encode(invoice_id.as_bytes()));
 
         Ok((address, index, Some(reference)))
     }
@@ -285,7 +279,7 @@ impl NetworkClient for EsploraNetwork {
         }
     }
 
-    async fn watch_payments(&self) -> Result<(), String> {
+    async fn watch_payments(&self, pool: &PgPool) -> Result<(), String> {
         println!("EsploraNetwork::watch_payments processing loop started with {} endpoints", self.api_urls.len());
 
         loop {
@@ -307,7 +301,7 @@ impl NetworkClient for EsploraNetwork {
 
                             let matching_tx = txs.iter().find(|tx| {
                                 tx.vout.iter().any(|out| {
-                                    out.scriptpubkey_address.as_deref() == Some(&watch.address)
+                                    out.scriptpubkey_address.as_deref() == Some(watch.address.as_str())
                                         && (out.value as u128) >= target_satoshis
                                 })
                             });

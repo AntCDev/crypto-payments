@@ -6,9 +6,13 @@ use uuid::Uuid;
 use sqlx::PgPool;
 use chrono::{DateTime, Utc};
 use crate::networks::NetworkRegistry; // Import your central network registry
-
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Key, Nonce,
+};
 pub mod eth;
 pub mod base;
+pub mod base_sepolia;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PaymentDetails {
@@ -93,4 +97,15 @@ impl TokenRegistry {
     pub fn get_handler(&self, id: &str) -> Option<Arc<dyn TokenHandler>> {
         self.handlers.get(id).cloned()
     }
+}
+
+fn decrypt_data(master_key: &[u8; 32], ciphertext: &[u8], nonce_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if nonce_bytes.len() != 12 {
+        return Err("Invalid nonce length: expected 12 bytes".to_string());
+    }
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master_key));
+    let nonce = Nonce::from_slice(nonce_bytes);
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| "Decryption failed (tampered data or wrong key)".to_string())
 }
