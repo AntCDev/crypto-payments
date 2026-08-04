@@ -6,6 +6,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce, Key
+};
+use argon2::{
+    password_hash::{PasswordHasher, PasswordVerifier},
+};
+use sha2::{Digest};
+
+
+
 pub mod evm;
 pub mod sol;
 pub mod esplora;
@@ -259,4 +270,16 @@ async fn enqueue_webhook(
         .map_err(|e| format!("enqueue_webhook insert: {e}"))?;
 
     Ok(())
+}
+
+pub fn decrypt_data(master_key: &[u8; 32], ciphertext: &[u8], nonce_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if nonce_bytes.len() != 12 {
+        return Err("Invalid nonce length".to_string());
+    }
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master_key));
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| "Decryption failed (tampered data or wrong key)".to_string())
 }

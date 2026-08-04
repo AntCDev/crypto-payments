@@ -1,4 +1,4 @@
-use super::{enqueue_webhook, Amount, NetworkClient, PaymentWatch};
+use super::{enqueue_webhook, Amount, NetworkClient, PaymentWatch, decrypt_data};
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -89,22 +89,15 @@ const SCAN_SCOPE_LOGS: &str = "logs";
 /// TODO: per-provider config, and halve-and-retry on "response too large" errors.
 const MAX_LOG_BLOCK_RANGE: u64 = 1_000;
 
-/// ERC-20 invoice we're watching via contract Payment events. Wraps the plain
-/// WatchedInvoice so handle_reorg / refresh_confirmations / recompute_invoice_totals
-/// can be reused unchanged.
-#[derive(Clone)]
-struct WatchedTokenInvoice {
-    inner: WatchedInvoice,
-    /// The exact ERC-20 the invoice was issued in. A Payment event for the
-    /// right invoice id but the wrong token is NOT credited.
-    token_lc: String,
-}
 
 
 /// keccak256("Payment(address,address,bytes16,address,uint256,uint256,uint256)")
 /// Fallback if TOPIC_0 isn't set in the environment.
 const DEFAULT_PAYMENT_TOPIC0: &str =
     "0x099d178f911e9b704ac40d2373ef01bce3f790aeca9723177c283461078bd70a";
+
+const NATIVE_TOKEN_SENTINEL: &str = "0x0000000000000000000000000000000000000000";
+
 
 fn payment_topic0() -> &'static str {
     static TOPIC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -201,13 +194,12 @@ fn wei_to_decimal(v: u128) -> Result<rust_decimal::Decimal, String> {
 struct WatchedInvoice {
     invoice_id: Uuid,
     merchant_id: Uuid,
-    address_lc: String,
+    address_lc: String,          // naive-QR per-invoice HD address
+    merchant_wallet_lc: String,  // index-0 merchant wallet for smart contract path
     amount_requested: rust_decimal::Decimal,
-    /// Per-invoice merchant threshold, snapshotted at invoice creation.
-    /// Falls back to FINAL_CONFIRMATIONS if the merchant never set one.
     required_confirmations: i64,
-    /// Don't credit anything that landed before the invoice existed.
     created_block: Option<i64>,
+    token_lc: Option<String>,
 }
 
 /// One canonical block, only the bits we need.
@@ -418,27 +410,29 @@ impl EVMNetwork {
     /// token_address IS NULL => native currency (ETH/MATIC/...). ERC-20s are
     /// matched by Transfer logs in watch_logs, keyed on the exact token address.
     async fn load_watched_invoices(&self, pool: &PgPool) -> Result<Vec<WatchedInvoice>, String> {
-        let rows = sqlx::query_as::<_, (Uuid, Uuid, String, rust_decimal::Decimal, i64, Option<i64>)>(
+        let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, rust_decimal::Decimal, i64, Option<i64>, Option<String>)>(
             r#"
-            SELECT i.id,
-                   i.merchant_id,
-                   lower(i.wallet_address),
-                   i.amount_requested,
-                   COALESCE(i.required_confirmations, $3)::bigint,
-                   i.created_block
-              FROM invoices i
-             WHERE i.network_type = $1
-               AND i.chain_ref    = $2
-               AND i.token_address IS NULL
-               AND (
-                     (i.status = 'pending' AND i.expires_at > now())
-                  OR EXISTS (
-                        SELECT 1 FROM payments p
-                         WHERE p.invoice_id = i.id
-                           AND p.status IN ('detected', 'merchant_confirmed')
-                     )
-               )
-            "#,
+    SELECT i.id,
+           i.merchant_id,
+           lower(i.wallet_address),
+           lower(mw.address),
+           i.amount_requested,
+           COALESCE(i.required_confirmations, $3)::bigint,
+           i.created_block,
+           lower(i.token_address)
+      FROM invoices i
+      JOIN merchant_wallets mw
+        ON mw.merchant_id  = i.merchant_id
+       AND mw.network_type = $1
+     WHERE i.network_type = $1
+       AND i.chain_ref   = $2
+       AND (
+             (i.status = 'pending' AND i.expires_at > now())
+          OR EXISTS (SELECT 1 FROM payments p
+                      WHERE p.invoice_id = i.id
+                        AND p.status IN ('detected','merchant_confirmed'))
+       )
+    "#,
         )
             .bind(NETWORK_TYPE)
             .bind(self.chain_ref())
@@ -447,9 +441,21 @@ impl EVMNetwork {
             .await
             .map_err(|e| format!("load_watched_invoices: {e}"))?;
 
-        Ok(rows.into_iter().map(|(invoice_id, merchant_id, address_lc, amount_requested, required_confirmations, created_block)| {
-            WatchedInvoice { invoice_id, merchant_id, address_lc, amount_requested, required_confirmations, created_block }
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(invoice_id, merchant_id, address_lc, merchant_wallet_lc, amount_requested, required_confirmations, created_block, token_lc)| {
+                WatchedInvoice {
+                    invoice_id,
+                    merchant_id,
+                    address_lc,
+                    merchant_wallet_lc,
+                    amount_requested,
+                    required_confirmations,
+                    created_block,
+                    token_lc,
+                }
+            })
+            .collect())
     }
 
     // ── The service loop ─────────────────────────────────────────────────────
@@ -1331,51 +1337,6 @@ impl EVMNetwork {
         Ok(format!("0x{}", hex::encode(address_bytes)))
     }
 
-    /// ERC-20 invoices with an open interest on this chain. Mirror image of
-    /// load_watched_invoices: token_address IS NOT NULL means "paid through the
-    /// vault contract, matched by Payment logs", not by native transfers.
-    async fn load_watched_token_invoices(&self, pool: &PgPool) -> Result<Vec<WatchedTokenInvoice>, String> {
-        let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, rust_decimal::Decimal, i64, Option<i64>)>(
-            r#"
-            SELECT i.id,
-                   i.merchant_id,
-                   lower(i.wallet_address),
-                   lower(i.token_address),
-                   i.amount_requested,
-                   COALESCE(i.required_confirmations, $3)::bigint,
-                   i.created_block
-              FROM invoices i
-             WHERE i.network_type = $1
-               AND i.chain_ref  = $2
-               AND i.token_address IS NOT NULL
-               AND (
-                     (i.status = 'pending' AND i.expires_at > now())
-                  OR EXISTS (
-                        SELECT 1 FROM payments p
-                         WHERE p.invoice_id = i.id
-                           AND p.status IN ('detected', 'merchant_confirmed')
-                     )
-               )
-            "#,
-        )
-            .bind(NETWORK_TYPE)
-            .bind(self.chain_ref())
-            .bind(FINAL_CONFIRMATIONS)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| format!("load_watched_token_invoices: {e}"))?;
-
-        Ok(rows.into_iter().map(|(invoice_id, merchant_id, address_lc, token_lc, amount_requested, required_confirmations, created_block)| {
-            WatchedTokenInvoice {
-                inner: WatchedInvoice {
-                    invoice_id, merchant_id, address_lc,
-                    amount_requested, required_confirmations, created_block,
-                },
-                token_lc,
-            }
-        }).collect())
-    }
-
     /// Fork detection for a SPARSE history. The logs scanner only anchors one
     /// header per getLogs chunk, so unlike detect_fork_point we can't demand a
     /// remembered hash at every height — we walk back through the anchors we
@@ -1432,7 +1393,7 @@ impl EVMNetwork {
         &self,
         pool: &PgPool,
         log: &Log,
-        by_id: &HashMap<Uuid, WatchedTokenInvoice>,
+        by_id: &HashMap<Uuid, WatchedInvoice>,
     ) -> Result<(), String> {
         if log.removed {
             return Ok(()); // reorg-removed entry from a lagging provider; reorg path owns this
@@ -1448,25 +1409,27 @@ impl EVMNetwork {
             }
         };
 
-        let Some(w) = by_id.get(&ev.invoice_id) else {
+        let Some(inv) = by_id.get(&ev.invoice_id) else {
             return Ok(()); // not an invoice we're watching (settled, expired, other env)
         };
-        let inv = &w.inner;
 
-        // Defense in depth: the identifier alone is attacker-suppliable calldata.
-        // The money only counts if it's the right token credited to the right
-        // merchant wallet — both of which the contract guarantees in the event.
-        if w.token_lc != ev.token_lc {
+        // Defense in depth: verify the money is credited to the right merchant wallet.
+        if inv.merchant_wallet_lc != ev.merchant_lc {
             eprintln!(
-                "[{}] Payment log for invoice {} has wrong token {} (expected {}), ignoring",
-                self.network_name, ev.invoice_id, ev.token_lc, w.token_lc
+                "[{}] Payment log for invoice {} credits wrong merchant {} (expected {}), ignoring",
+                self.network_name, ev.invoice_id, ev.merchant_lc, inv.merchant_wallet_lc
             );
             return Ok(());
         }
-        if inv.address_lc != ev.merchant_lc {
+
+        // Defense in depth: verify the token paid matches what the invoice expects.
+        // token_lc == None means a native-currency invoice, whose only valid token
+        // on the vault is the NATIVE sentinel (address(0)) — same value payNative() emits.
+        let expected_token: &str = inv.token_lc.as_deref().unwrap_or(NATIVE_TOKEN_SENTINEL);
+        if expected_token != ev.token_lc {
             eprintln!(
-                "[{}] Payment log for invoice {} credits wrong merchant {} (expected {}), ignoring",
-                self.network_name, ev.invoice_id, ev.merchant_lc, inv.address_lc
+                "[{}] Payment log for invoice {} paid in wrong token {} (expected {}), ignoring",
+                self.network_name, ev.invoice_id, ev.token_lc, expected_token
             );
             return Ok(());
         }
@@ -1494,11 +1457,11 @@ impl EVMNetwork {
 
         let inserted = sqlx::query(
             r#"
-            INSERT INTO payments
-                (invoice_id, tx_hash, amount, block_number, block_hash, confirmations, status)
-            VALUES ($1, $2, $3, $4, $5, 0, 'detected')
-            ON CONFLICT (invoice_id, tx_hash) DO NOTHING
-            "#,
+        INSERT INTO payments
+            (invoice_id, tx_hash, amount, block_number, block_hash, confirmations, status)
+        VALUES ($1, $2, $3, $4, $5, 0, 'detected')
+        ON CONFLICT (invoice_id, tx_hash) DO NOTHING
+        "#,
         )
             .bind(inv.invoice_id)
             .bind(&tx_hash)
@@ -1549,13 +1512,13 @@ impl EVMNetwork {
             // never the amount.
             sqlx::query(
                 r#"
-                UPDATE payments
-                   SET block_number = $2, block_hash = $3,
-                       status = CASE WHEN status = 'orphaned' THEN 'detected' ELSE status END,
-                       updated_at = now()
-                 WHERE invoice_id = $1 AND tx_hash = $4
-                   AND (block_hash <> $3 OR status = 'orphaned')
-                "#,
+            UPDATE payments
+               SET block_number = $2, block_hash = $3,
+                   status = CASE WHEN status = 'orphaned' THEN 'detected' ELSE status END,
+                   updated_at = now()
+             WHERE invoice_id = $1 AND tx_hash = $4
+               AND (block_hash <> $3 OR status = 'orphaned')
+            "#,
             )
                 .bind(inv.invoice_id)
                 .bind(block_number)
@@ -1601,13 +1564,13 @@ impl EVMNetwork {
     }
 
     async fn tick_logs(&self, pool: &PgPool, contract_lc: &str) -> Result<(), String> {
-        let watched = self.load_watched_token_invoices(pool).await?;
-        // Plain view for the shared machinery (reorg unwind, confirmations, totals).
-        let watched_plain: Vec<WatchedInvoice> = watched.iter().map(|w| w.inner.clone()).collect();
+        let watched = self.load_watched_invoices(pool).await?;
+
         // Payment logs carry the invoice UUID natively (bytes16 identifier), so
         // unlike the address scanner this map is keyed by id — no multimap needed.
-        let by_id: HashMap<Uuid, WatchedTokenInvoice> = watched.iter()
-            .map(|w| (w.inner.invoice_id, w.clone()))
+        let by_id: HashMap<Uuid, WatchedInvoice> = watched
+            .iter()
+            .map(|w| (w.invoice_id, w.clone()))
             .collect();
 
         let tip = self.get_block_number().await? as i64;
@@ -1618,27 +1581,29 @@ impl EVMNetwork {
             None => {
                 let start = sqlx::query_scalar::<_, Option<i64>>(
                     r#"
-                    SELECT MIN(i.created_block)
-                      FROM invoices i
-                     WHERE i.network_type = $1 AND i.chain_ref = $2
-                       AND i.token_address IS NOT NULL
-                       AND (
-                             (i.status = 'pending' AND i.expires_at > now())
-                          OR EXISTS (SELECT 1 FROM payments p
-                                      WHERE p.invoice_id = i.id
-                                        AND p.status IN ('detected','merchant_confirmed'))
-                       )
-                    "#,
+                SELECT MIN(i.created_block)
+                  FROM invoices i
+                 WHERE i.network_type = $1 AND i.chain_ref = $2
+                   AND (
+                         (i.status = 'pending' AND i.expires_at > now())
+                      OR EXISTS (SELECT 1 FROM payments p
+                                  WHERE p.invoice_id = i.id
+                                    AND p.status IN ('detected','merchant_confirmed'))
+                   )
+                "#,
                 )
-                    .bind(NETWORK_TYPE).bind(self.chain_ref())
-                    .fetch_one(pool).await
+                    .bind(NETWORK_TYPE)
+                    .bind(self.chain_ref())
+                    .fetch_one(pool)
+                    .await
                     .map_err(|e| format!("logs cold start floor: {e}"))?
                     .unwrap_or(tip);
 
                 let from = (start - 1).max(0);
                 println!(
                     "[{}] no logs scan cursor, cold-starting at block {}",
-                    self.network_name, from + 1
+                    self.network_name,
+                    from + 1
                 );
                 Some((from, String::new()))
             }
@@ -1657,7 +1622,7 @@ impl EVMNetwork {
                             "[{}] logs reorg detected: cursor was {}, rewinding to {}",
                             self.network_name, last_block, fork_point
                         );
-                        self.handle_reorg(pool, fork_point, &watched_plain).await?;
+                        self.handle_reorg(pool, fork_point, &watched).await?;
                         let fork_hash = self
                             .our_hash_at(pool, SCAN_SCOPE_LOGS, fork_point)
                             .await?
@@ -1681,11 +1646,11 @@ impl EVMNetwork {
             let to = std::cmp::min(from + MAX_LOG_BLOCK_RANGE as i64 - 1, target);
 
             let filter = serde_json::json!({
-                "address": contract_lc,
-                "topics": [payment_topic0()],
-                "fromBlock": format!("0x{:x}", from),
-                "toBlock": format!("0x{:x}", to),
-            });
+            "address": contract_lc,
+            "topics": [payment_topic0()],
+            "fromBlock": format!("0x{:x}", from),
+            "toBlock": format!("0x{:x}", to),
+        });
             let logs = self.get_logs(filter).await?;
 
             // Anchor: the header of the chunk's last block. This is what the
@@ -1709,12 +1674,11 @@ impl EVMNetwork {
 
         // 4. Confirmations off the DB against the current tip — identical
         //  machinery to the native path, payments rows are payments rows.
-        self.refresh_confirmations(pool, tip, &watched_plain).await?;
+        self.refresh_confirmations(pool, tip, &watched).await?;
 
         self.prune_seen_blocks(pool, SCAN_SCOPE_LOGS, last_block).await?;
         Ok(())
     }
-
 }
 
 #[async_trait]

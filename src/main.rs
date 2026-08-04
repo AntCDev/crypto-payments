@@ -151,6 +151,21 @@ async fn initialize_database(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // 5a. Create Merchant Main Wallets
+    sqlx::query(
+        r#"
+CREATE TABLE IF NOT EXISTS merchant_wallets (
+    merchant_id  UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    network_type VARCHAR(20) NOT NULL,   -- 'evm' / 'solana' / etc.
+    address      VARCHAR(255) NOT NULL,  -- lowercase for evm; keep native case for solana
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (merchant_id, network_type)
+);
+        "#
+    )
+        .execute(pool)
+        .await?;
+
     // 6. Per-chain scan cursor. This is what makes watch_addresses restart-safe:
     //    we never rely on `self.pending` for "where was I", only for "who do I care about".
     sqlx::query(
