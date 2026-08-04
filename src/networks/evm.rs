@@ -1,12 +1,13 @@
-use super::{Amount, NetworkClient, PaymentWatch};
+use super::{enqueue_webhook, Amount, NetworkClient, PaymentWatch};
 use async_trait::async_trait;
 use uuid::Uuid;
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::sleep;
+use serde_json::{json, Map, Value};
+use sqlx::{Postgres, Transaction};
 
 use bip32::{DerivationPath, PrivateKey, XPrv};
 use bip39::Mnemonic;
@@ -67,8 +68,6 @@ struct BlockRecord {
     number: u64,
     hash: String,
 }
-
-
 
 
 
@@ -700,15 +699,18 @@ impl EVMNetwork {
                 // Known to the node but back in the mempool, or dropped entirely.
                 // Mempool, missing hash/number, or completely dropped
                 Some((Some(_), None)) | Some((None, _)) | None => {
+                    let mut tx = pool.begin().await
+                        .map_err(|e| format!("handle_reorg begin tx: {e}"))?;
+
                     sqlx::query(
                         r#"
-                        UPDATE payments
-                           SET status = 'orphaned', confirmations = 0, updated_at = now()
-                         WHERE id = $1
-                        "#,
+        UPDATE payments
+           SET status = 'orphaned', confirmations = 0, updated_at = now()
+         WHERE id = $1
+        "#,
                     )
                         .bind(payment_id)
-                        .execute(pool).await
+                        .execute(&mut *tx).await
                         .map_err(|e| format!("handle_reorg orphan update: {e}"))?;
 
                     println!(
@@ -716,19 +718,23 @@ impl EVMNetwork {
                         self.network_name, payment_id, tx_hash, old_block, old_hash, old_status
                     );
 
-                    // ── WEBHOOK ───────────────────────────────────────────────
-                    // Register 'payment.orphaned' for invoice `invoice_id`
-                    // (payment_id, tx_hash, old block/hash, previous status).
+                    let mut fields = Map::new();
+                    fields.insert("PaymentId".into(), json!(payment_id));
+                    fields.insert("TxHash".into(), json!(tx_hash));
+                    fields.insert("OldBlockNumber".into(), json!(old_block));
+                    fields.insert("OldBlockHash".into(), json!(old_hash));
+                    fields.insert("PreviousStatus".into(), json!(old_status));
+
                     // This is the *only* reorg case that notifies the merchant:
                     // the funds they were told about are gone, so anything they
                     // shipped on the back of payment.detected/confirmed needs to
                     // be walked back on their side.
-                    //   INSERT INTO webhooks (merchant_id, invoice_id, event, payload, ...)
-                    //   VALUES (..., 'payment.orphaned', ...);
-                    // TODO: make delivery of this event opt-out-able per merchant
-                    //       (some only care about final state) once merchant
-                    //       webhook settings exist.
-                    // ──────────────────────────────────────────────────────────
+
+                    // TODO: skip this call entirely once merchant webhook settings exist and this merchant has opted out of orphaned notifications.
+                    enqueue_webhook(&mut tx, invoice_id, "payment.orphaned", &payment_id.to_string(), fields).await?;
+
+                    tx.commit().await
+                        .map_err(|e| format!("handle_reorg commit tx: {e}"))?;
                 }
             }
 
@@ -763,28 +769,27 @@ impl EVMNetwork {
             for inv in invoices {
                 if let Some(created) = inv.created_block {
                     if (block.number as i64) < created {
-                        continue; // predates the invoice, not our money
+                        continue;
                     }
                 }
 
-                // Idempotent insert on (invoice_id, tx_hash). This is what makes
-                // a crash mid-block, a duplicate registration, or a rescan of an
-                // already-scanned range harmless. `rows_affected == 1` means we
-                // saw it for the first time, which is exactly the webhook edge.
+                let mut tx = pool.begin().await
+                    .map_err(|e| format!("apply_block begin tx: {e}"))?;
+
                 let inserted = sqlx::query(
                     r#"
-                    INSERT INTO payments
-                        (invoice_id, tx_hash, amount, block_number, block_hash, confirmations, status)
-                    VALUES ($1, $2, $3, $4, $5, 0, 'detected')
-                    ON CONFLICT (invoice_id, tx_hash) DO NOTHING
-                    "#,
+        INSERT INTO payments
+            (invoice_id, tx_hash, amount, block_number, block_hash, confirmations, status)
+        VALUES ($1, $2, $3, $4, $5, 0, 'detected')
+        ON CONFLICT (invoice_id, tx_hash) DO NOTHING
+        "#,
                 )
                     .bind(inv.invoice_id)
                     .bind(tx_hash)
                     .bind(amount)
                     .bind(block.number as i64)
                     .bind(&block.hash)
-                    .execute(pool).await
+                    .execute(&mut *tx).await
                     .map_err(|e| format!("insert payment: {e}"))?
                     .rows_affected() == 1;
 
@@ -794,39 +799,36 @@ impl EVMNetwork {
                         self.network_name, value, to_lc, inv.invoice_id, tx_hash, block.number
                     );
 
-                    // ── WEBHOOK ───────────────────────────────────────────────
+                    let mut fields = Map::new();
+                    fields.insert("TxHash".into(), json!(tx_hash));
+                    fields.insert("AmountBaseUnits".into(), json!(amount.to_string()));
+                    fields.insert("BlockNumber".into(), json!(block.number));
+                    fields.insert("BlockHash".into(), json!(block.hash));
+                    fields.insert("Confirmations".into(), json!(0));
+
                     // First time we've ever seen this tx for this invoice.
-                    // Register 'payment.detected' for merchant `inv.merchant_id`
-                    // / invoice `inv.invoice_id` with tx_hash, base-unit amount,
-                    // block_number, block_hash, confirmations = 0.
-                    //   INSERT INTO webhooks (merchant_id, invoice_id, event, payload, ...)
-                    //   VALUES (inv.merchant_id, inv.invoice_id, 'payment.detected', ...);
-                    // The unique index above is what guarantees exactly-once
-                    // here, so the insert of the webhook row belongs in the SAME
-                    // transaction as the payment insert.
-                    // TODO: wrap payment-insert + webhook-insert in one tx.
-                    // ──────────────────────────────────────────────────────────
+                    enqueue_webhook(&mut tx, inv.invoice_id, "payment.detected", tx_hash, fields).await?;
                 } else {
-                    // Already known. Could be a rescan, or the same tx re-mined
-                    // into a different block after a reorg — keep the location
-                    // fresh either way, but never touch the amount.
                     sqlx::query(
                         r#"
-                        UPDATE payments
-                           SET block_number = $2, block_hash = $3,
-                               status = CASE WHEN status = 'orphaned' THEN 'detected' ELSE status END,
-                               updated_at = now()
-                         WHERE invoice_id = $1 AND tx_hash = $4
-                           AND (block_hash <> $3 OR status = 'orphaned')
-                        "#,
+            UPDATE payments
+               SET block_number = $2, block_hash = $3,
+                   status = CASE WHEN status = 'orphaned' THEN 'detected' ELSE status END,
+                   updated_at = now()
+             WHERE invoice_id = $1 AND tx_hash = $4
+               AND (block_hash <> $3 OR status = 'orphaned')
+            "#,
                     )
                         .bind(inv.invoice_id)
                         .bind(block.number as i64)
                         .bind(&block.hash)
                         .bind(tx_hash)
-                        .execute(pool).await
+                        .execute(&mut *tx).await
                         .map_err(|e| format!("relocate payment: {e}"))?;
                 }
+
+                tx.commit().await
+                    .map_err(|e| format!("apply_block commit tx: {e}"))?;
 
                 self.recompute_invoice_totals(pool, inv.invoice_id, std::slice::from_ref(inv)).await?;
             }
@@ -905,26 +907,31 @@ impl EVMNetwork {
                     );
 
                     // ── WEBHOOK ───────────────────────────────────────────────
-                    // Register 'payment.confirmed' for merchant `merchant_id` /
-                    // invoice `invoice_id`: payment_id, tx_hash, block_number,
-                    // confirmations, required_confirmations.
+                    // Notify the merchant that this payment crossed their
+                    // required confirmation threshold and is now confirmed.
+                    let mut tx = pool.begin().await
+                        .map_err(|e| format!("refresh_confirmations begin tx (confirmed): {e}"))?;
+
+                    let mut fields = Map::new();
+                    fields.insert("PaymentId".into(), json!(payment_id));
+                    fields.insert("TxHash".into(), json!(tx_hash));
+                    fields.insert("BlockNumber".into(), json!(block_number));
+                    fields.insert("Confirmations".into(), json!(confirmations));
+                    fields.insert("RequiredConfirmations".into(), json!(required));
+
                     // The guarded UPDATE above (status = 'detected' in the WHERE)
                     // is the once-only latch, so two workers racing can't both
                     // emit this.
-                    //   INSERT INTO webhooks (..., 'payment.confirmed', ...);
-                    // TODO: `required` currently comes from
-                    //       invoices.required_confirmations with a fallback to
-                    //       FINAL_CONFIRMATIONS. Make it resolve per-merchant /
-                    //       per-chain / per-amount (big payments wait longer)
-                    //       from a merchant_confirmation_policy table.
+                    enqueue_webhook(&mut tx, invoice_id, "payment.confirmed", &payment_id.to_string(), fields).await?;
+
+                    tx.commit().await
+                        .map_err(|e| format!("refresh_confirmations commit tx (confirmed): {e}"))?;
                     // ──────────────────────────────────────────────────────────
                 }
             }
 
             // ── final / system threshold ─────────────────────────────────────
-            // TODO: FINAL_CONFIRMATIONS is a global constant today; it should be
-            //       per-chain (48 blocks on Ethereum ≈ 10 min, on Polygon it's
-            //       ~2 min and you probably want a lot more).
+            // TODO: FINAL_CONFIRMATIONS is a global constant today; it should be per-chain (48 blocks on Ethereum ≈ 10 min, on Polygon it's ~2 min and you probably want a lot more).
             if confirmations >= FINAL_CONFIRMATIONS {
                 let finalized = sqlx::query(
                     r#"
@@ -945,14 +952,23 @@ impl EVMNetwork {
                     );
 
                     // ── WEBHOOK (optional) ────────────────────────────────────
-                    // Register 'payment.finalized' — we now consider this
-                    // irreversible and will never emit payment.orphaned for it.
-                    // Mostly interesting to merchants who hold shipment until
-                    // settlement is final.
-                    //   INSERT INTO webhooks (..., 'payment.finalized', ...);
-                    // TODO: gate on merchant settings; default off since most
-                    //       merchants act on payment.confirmed.
+                    // Lets merchants who hold shipment until settlement is
+                    // final know this payment is now irreversible.
+                    let mut tx = pool.begin().await
+                        .map_err(|e| format!("refresh_confirmations begin tx (finalized): {e}"))?;
+
+                    let mut fields = Map::new();
+                    fields.insert("PaymentId".into(), json!(payment_id));
+                    fields.insert("TxHash".into(), json!(tx_hash));
+                    fields.insert("BlockNumber".into(), json!(block_number));
+                    fields.insert("Confirmations".into(), json!(confirmations));
+
+                    enqueue_webhook(&mut tx, invoice_id, "payment.finalized", &payment_id.to_string(), fields).await?;
+
+                    tx.commit().await
+                        .map_err(|e| format!("refresh_confirmations commit tx (finalized): {e}"))?;
                     // ──────────────────────────────────────────────────────────
+
                 }
             }
 
@@ -1051,15 +1067,22 @@ impl EVMNetwork {
                 );
 
                 // ── WEBHOOK ───────────────────────────────────────────────────
-                // amount_received >= amount_requested, i.e. the invoice is fully
-                // funded. THIS is the 'payment.finished' event — register it for
-                // merchant `inv.merchant_id` / invoice `invoice_id` with
-                // amount_received, amount_requested and the overpaid flag.
-                //   INSERT INTO webhooks (..., 'payment.finished', ...);
-                //
+                // Invoice fully funded (amount_received >= amount_requested).
                 // Fired on the *amount* threshold, independent of confirmations
                 // — payment.detected/confirmed/finalized carry the confirmation
                 // story. The status guard in the UPDATE above makes it once-only.
+                let mut tx = pool.begin().await
+                    .map_err(|e| format!("recompute_invoice_totals begin tx: {e}"))?;
+
+                let mut fields = Map::new();
+                fields.insert("AmountReceived".into(), json!(received));
+                fields.insert("AmountRequested".into(), json!(inv.amount_requested));
+                fields.insert("Overpaid".into(), json!(new_status == "overpaid"));
+
+                enqueue_webhook(&mut tx, invoice_id, "payment.finished", &new_status.to_string(), fields).await?;
+
+                tx.commit().await
+                    .map_err(|e| format!("recompute_invoice_totals commit tx: {e}"))?;
                 // TODO: make the trigger policy a merchant setting:
                 //       'on_detected' (fire now, current behaviour),
                 //       'on_confirmed' (require every contributing payment to be
@@ -1067,6 +1090,7 @@ impl EVMNetwork {
                 // TODO: also decide the underpaid tolerance here (dust /
                 //       rounding), currently strict >=.
                 // ──────────────────────────────────────────────────────────────
+
             } else if !is_settled && was_settled {
                 // Reorg clawed us back below the requested amount. The
                 // payment.orphaned event already told the merchant why, so we
@@ -1465,6 +1489,9 @@ impl EVMNetwork {
         // TODO: (invoice_id, tx_hash) uniqueness collapses two Payment events
         //     for the SAME invoice inside the SAME tx (e.g. a batching router)
         //     into one credit. Needs log_index in the unique key to support that.
+        let mut db_tx = pool.begin().await
+            .map_err(|e| format!("apply_payment_log begin tx: {e}"))?;
+
         let inserted = sqlx::query(
             r#"
             INSERT INTO payments
@@ -1478,7 +1505,7 @@ impl EVMNetwork {
             .bind(amount)
             .bind(block_number)
             .bind(&block_hash)
-            .execute(pool).await
+            .execute(&mut *db_tx).await
             .map_err(|e| format!("insert token payment: {e}"))?
             .rows_affected() == 1;
 
@@ -1496,15 +1523,28 @@ impl EVMNetwork {
             }
 
             // ── WEBHOOK ───────────────────────────────────────────────────────
-            // First sighting of this tx for this invoice. Register
-            // 'payment.detected' for merchant `inv.merchant_id` / invoice
-            // `inv.invoice_id` with token, tx_hash, payer, base-unit amount
-            // (amount_received), block_number, block_hash, confirmations = 0.
-            // Same exactly-once guarantee as the native path: the unique index
-            // is the latch, so the webhook row belongs in the SAME db tx.
-            // TODO: wrap payment-insert + webhook-insert in one tx.
+            // First sighting of this tx for this invoice. Same exactly-once
+            // guarantee as the native path: the unique index on payments is the
+            // latch, so insert + webhook now share the one db tx and commit
+            // (or roll back) together.
+            let mut fields = Map::new();
+            fields.insert("TokenAddress".into(), json!(ev.token_lc));
+            fields.insert("TxHash".into(), json!(tx_hash));
+            fields.insert("Payer".into(), json!(ev.payer_lc));
+            fields.insert("AmountReceived".into(), json!(amount));
+            fields.insert("BlockNumber".into(), json!(block_number));
+            fields.insert("BlockHash".into(), json!(block_hash));
+            fields.insert("Confirmations".into(), json!(0));
+
+            enqueue_webhook(&mut db_tx, inv.invoice_id, "payment.detected", &tx_hash, fields).await?;
             // ──────────────────────────────────────────────────────────────────
+
+            db_tx.commit().await
+                .map_err(|e| format!("apply_payment_log commit tx: {e}"))?;
         } else {
+            db_tx.rollback().await
+                .map_err(|e| format!("apply_payment_log rollback tx: {e}"))?;
+
             // Already known — rescan, or re-mined post-reorg. Refresh location,
             // never the amount.
             sqlx::query(

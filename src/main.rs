@@ -183,6 +183,100 @@ async fn initialize_database(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     "#
     ).execute(pool).await?;
 
+
+    // 8. Webhook Events Table (transactional outbox for merchant webhook delivery)
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS webhook_events (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+
+            -- Snapshot the URL at enqueue time. If the merchant edits webhook_url on
+            -- merchants mid-retry, you don't want an in-flight event silently
+            -- redirecting to wherever they just pointed it.
+            url TEXT NOT NULL,
+
+            event_type VARCHAR(100) NOT NULL,   -- e.g. 'invoice.paid', 'invoice.expired'
+            event_data JSONB NOT NULL,
+
+            -- Lets the producer (invoice/payment logic) be called twice for the same
+            -- underlying event without double-enqueuing. Something like
+            -- 'invoice.paid:<invoice_id>' or 'payment.confirmed:<payment_id>'.
+            dedupe_key VARCHAR(255) NOT NULL,
+
+            status VARCHAR(20) NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'dead', 'cancelled')),
+
+            attempt_count SMALLINT NOT NULL DEFAULT 0,
+            max_attempts SMALLINT NOT NULL DEFAULT 10,
+
+            next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            last_attempt_at TIMESTAMPTZ,
+
+            last_response_code SMALLINT,
+            last_error TEXT,
+
+            -- Claim fields so you can run more than one dispatcher instance safely with
+            -- SELECT ... FOR UPDATE SKIP LOCKED, instead of relying on a single worker.
+            locked_at TIMESTAMPTZ,
+            locked_by VARCHAR(100),
+
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        "#
+    )
+        .execute(pool)
+        .await?;
+
+    // 8b. Idempotency guard: same merchant can't get the same logical event enqueued twice.
+    sqlx::query(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS webhook_events_dedupe_uniq
+            ON webhook_events (merchant_id, dedupe_key);
+        "#
+    )
+        .execute(pool)
+        .await?;
+
+    // 8c. The one query your dispatcher loop actually runs: "what's due, oldest first".
+    //     Partial index keeps it tiny since 'pending' rows are a small fraction of the table.
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS webhook_events_ready_idx
+            ON webhook_events (next_attempt_at)
+            WHERE status = 'pending';
+        "#
+    )
+        .execute(pool)
+        .await?;
+
+    // 9. Webhook Delivery Attempts Table (append-only history, one row per HTTP call)
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            webhook_event_id UUID NOT NULL REFERENCES webhook_events(id) ON DELETE CASCADE,
+            attempt_number SMALLINT NOT NULL,
+            response_code SMALLINT,
+            error TEXT,
+            duration_ms INT,
+            attempted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        "#
+    )
+        .execute(pool)
+        .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS webhook_delivery_attempts_event_idx
+            ON webhook_delivery_attempts (webhook_event_id);
+        "#
+    )
+        .execute(pool)
+        .await?;
+
     println!("Database tables initialized successfully (or already exist).");
     Ok(())
 }

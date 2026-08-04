@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Arc;
+use serde_json::{json, Map, Value};
 
 pub mod evm;
 pub mod sol;
@@ -180,4 +181,82 @@ pub trait NetworkClient: Send + Sync {
     fn register_payment(&self, watch: PaymentWatch);
     fn unregister_payment(&self, invoice_id: Uuid);
     async fn watch_payments(&self, pool: &PgPool) -> Result<(), String>;
+}
+
+
+/// Enqueues a webhook event for the merchant that owns `invoice_id`.
+///
+/// - Looks up the merchant's `webhook_url` and the invoice's opaque `data`
+///   field in one query, joined off invoice_id (no need for callers to carry
+///   merchant_id around separately).
+/// - If the merchant hasn't configured a webhook_url, this is a silent no-op —
+///   there's nowhere to deliver to yet, and no point enqueueing a row that'll
+///   never be dispatched.
+/// - `dedupe_suffix` should uniquely identify the underlying occurrence
+///   (payment_id, tx_hash, etc.) — it gets combined with event_type to form
+///   the dedupe_key, so calling this twice for the same real-world event is
+///   always safe (ON CONFLICT DO NOTHING against webhook_events_dedupe_uniq).
+/// - `fields` are the event-specific payload fields (TxHash, BlockNumber, ...);
+///   this function adds `Data` (the merchant's opaque invoice data) and
+///   `InvoiceId` on top.
+/// - Takes a `&mut Transaction` deliberately: call sites should insert/update
+///   whatever mutated the domain state and enqueue the webhook in the same
+///   transaction, so a rollback can never leave a webhook enqueued for a
+///   change that didn't happen (or vice versa).
+async fn enqueue_webhook(
+    tx: &mut Transaction<'_, Postgres>,
+    invoice_id: Uuid,
+    event_type: &str,
+    dedupe_suffix: &str,
+    mut fields: Map<String, Value>,
+) -> Result<(), String> {
+    let row: (Uuid, Option<String>, Option<String>) = sqlx::query_as(
+        r#"
+        SELECT m.id, m.webhook_url, i.data
+          FROM invoices i
+          JOIN merchants m ON m.id = i.merchant_id
+         WHERE i.id = $1
+        "#,
+    )
+        .bind(invoice_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| format!("enqueue_webhook merchant lookup: {e}"))?;
+
+    let (merchant_id, webhook_url, invoice_data) = row;
+
+    let Some(url) = webhook_url else {
+        // Merchant has no webhook configured — nothing to enqueue.
+        return Ok(());
+    };
+
+    // The merchant-supplied opaque payload from invoice creation. Left as a
+    // plain string on purpose: could be "25", could be `{"Amount":50}`, we
+    // don't parse it, the merchant does.
+    fields.insert(
+        "Data".to_string(),
+        invoice_data.map(Value::String).unwrap_or(Value::Null),
+    );
+    fields.insert("InvoiceId".to_string(), json!(invoice_id));
+
+    let event_data = Value::Object(fields);
+    let dedupe_key = format!("{event_type}:{dedupe_suffix}");
+
+    sqlx::query(
+        r#"
+        INSERT INTO webhook_events (merchant_id, url, event_type, event_data, dedupe_key)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (merchant_id, dedupe_key) DO NOTHING
+        "#,
+    )
+        .bind(merchant_id)
+        .bind(url)
+        .bind(event_type)
+        .bind(event_data)
+        .bind(dedupe_key)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| format!("enqueue_webhook insert: {e}"))?;
+
+    Ok(())
 }
