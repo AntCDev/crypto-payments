@@ -7,21 +7,27 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 
 /// @title CustodialPaymentVault
 /// @notice Minimal custodial payment processor vault. Customers pay into a per-(token, merchant)
-///         balance; the custodian later sweeps funds out on the merchant's behalf.
+///         balance; the custodian later sweeps funds out on the merchant's behalf. Native ETH is
+///         supported alongside ERC20 tokens, keyed internally as token == address(0).
 /// @dev No owner/admin/operator role exists on purpose. `sweep` is authorized purely by
 ///      msg.sender == merchantWallet. Since the backend custodies merchant private keys, it
 ///      satisfies this by signing the sweep tx directly as the merchant wallet — a role system
-///      would be redundant. Deploy this exact bytecode (ideally via a CREATE2 factory, e.g.
-///      Arachnid's deterministic deployer) to get the same contract address on every EVM chain.
+///      would be redundant.
 contract CustodialPaymentVault is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
+    /// @dev Sentinel token address representing native ETH in `_vault`, `Payment`, and `Swept`.
+    address private constant NATIVE = address(0);
+
     /// token => merchant => balance currently sitting in the vault, unswept
+    /// NATIVE (address(0)) is used as the token key for ETH balances.
     mapping(address => mapping(address => uint256)) private _vault;
 
     error ZeroAddress();
     error ZeroAmount();
     error NothingToSweep();
+    error NativeTransferFailed();
+    error UseNativePayment();
 
     /// @dev `identifier` is bytes16 on purpose: a UUIDv4 with dashes stripped is exactly 16
     ///      bytes, so invoice ids from any normal backend/db fit natively with zero re-encoding.
@@ -47,12 +53,13 @@ contract CustodialPaymentVault is ReentrancyGuard {
         uint256 timestamp
     );
 
-    /// @notice Pay an invoice. Pulls `amount` of `token` from msg.sender and credits the
-    ///         merchant's vault with whatever was ACTUALLY received (protects accounting against
-    ///         fee-on-transfer / deflationary / non-standard tokens — irrelevant for plain USDC
-    ///         today, but this makes the contract safe to reuse as-is once you support other
-    ///         tokens/chains).
-    /// @param token ERC20 token address being paid with.
+    /// @notice Pay an invoice with an ERC20 token. Pulls `amount` of `token` from msg.sender and
+    ///         credits the merchant's vault with whatever was ACTUALLY received (protects
+    ///         accounting against fee-on-transfer / deflationary / non-standard tokens —
+    ///         irrelevant for plain USDC today, but this makes the contract safe to reuse as-is
+    ///         once you support other tokens/chains).
+    /// @param token ERC20 token address being paid with. Must not be address(0); use
+    ///        `payNative` for ETH.
     /// @param amount Amount to pull from msg.sender (should match the invoice total, pre-fee).
     /// @param identifier Invoice identifier (see bytes16 note above).
     /// @param merchant Destination merchant wallet — this is your merchant id.
@@ -62,7 +69,8 @@ contract CustodialPaymentVault is ReentrancyGuard {
         bytes16 identifier,
         address merchant
     ) external nonReentrant {
-        if (token == address(0) || merchant == address(0)) revert ZeroAddress();
+        if (merchant == address(0)) revert ZeroAddress();
+        if (token == NATIVE) revert UseNativePayment();
         if (amount == 0) revert ZeroAmount();
 
         IERC20 t = IERC20(token);
@@ -75,7 +83,24 @@ contract CustodialPaymentVault is ReentrancyGuard {
         emit Payment(merchant, token, identifier, msg.sender, amount, received, block.timestamp);
     }
 
+    /// @notice Pay an invoice with native ETH. The full msg.value is credited to the merchant's
+    ///         vault (no fee-on-transfer concern for native currency, unlike ERC20s).
+    /// @param identifier Invoice identifier (see bytes16 note on Payment event).
+    /// @param merchant Destination merchant wallet — this is your merchant id.
+    function payNative(
+        bytes16 identifier,
+        address merchant
+    ) external payable nonReentrant {
+        if (merchant == address(0)) revert ZeroAddress();
+        if (msg.value == 0) revert ZeroAmount();
+
+        _vault[NATIVE][merchant] += msg.value;
+
+        emit Payment(merchant, NATIVE, identifier, msg.sender, msg.value, msg.value, block.timestamp);
+    }
+
     /// @notice Sweep the entire vault balance of `token` belonging to msg.sender, to msg.sender.
+    ///         Pass address(0) to sweep native ETH.
     /// @dev Effects (zeroing the balance) happen before the external transfer (checks-effects-
     ///      interactions), and nonReentrant blocks any callback-based reentry regardless.
     function sweep(address token) external nonReentrant {
@@ -84,21 +109,23 @@ contract CustodialPaymentVault is ReentrancyGuard {
 
         _vault[token][msg.sender] = 0;
 
-        IERC20(token).safeTransfer(msg.sender, amount);
+        if (token == NATIVE) {
+            (bool success, ) = payable(msg.sender).call{value: amount}("");
+            if (!success) revert NativeTransferFailed();
+        } else {
+            IERC20(token).safeTransfer(msg.sender, amount);
+        }
 
         emit Swept(msg.sender, token, amount, block.timestamp);
     }
 
-    // ---------------------------------------------------------------------
-    // Free (view) reads — no gas cost when called via eth_call / a read RPC
-    // ---------------------------------------------------------------------
-
-    /// @notice Current unswept balance of `token` held for `merchant`.
+    /// @notice Current unswept balance of `token` held for `merchant`. Pass address(0) for ETH.
     function balanceOf(address merchant, address token) external view returns (uint256) {
         return _vault[token][merchant];
     }
 
     /// @notice Batch read: balances of several tokens for one merchant, one call.
+    ///         Include address(0) in `tokens` to read the merchant's ETH balance.
     function balancesOf(address merchant, address[] calldata tokens)
         external
         view
@@ -120,5 +147,14 @@ contract CustodialPaymentVault is ReentrancyGuard {
         for (uint256 i = 0; i < merchants.length; ++i) {
             balances[i] = _vault[token][merchants[i]];
         }
+    }
+
+    /// @dev Deliberately rejects bare ETH transfers instead of silently crediting them. A plain
+    ///      `send`/`transfer`/`call{value:x}("")` to this address carries no merchant or invoice
+    ///      identifier, so there is no way to attribute the funds — and since there is no
+    ///      owner/admin role, misattributed or stranded ETH could never be recovered. Callers
+    ///      must go through `payNative`, which requires an explicit merchant address.
+    receive() external payable {
+        revert UseNativePayment();
     }
 }
