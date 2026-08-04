@@ -78,15 +78,15 @@ The system is split into three layers:
 This separation means adding a new chain means implementing one trait, and adding a new token on an existing chain means (in most cases) registering a handler with different parameters — not writing new payment-detection logic from scratch.
 
 ## Webhooks
+Payments can be underpaid, overpaid, or corrected across multiple transactions, so the webhook model reports state rather than a single "paid" boolean. Most events are per-transaction; `payment.finished` is the exception, reported at the invoice level.
 
-Payments can be underpaid, overpaid, or corrected across multiple transactions, so the webhook model reports state rather than a single "paid" boolean:
+- `payment.detected` — fired on detected funds, reporting received/total/expected amounts (so partial payments are visible)
+- `payment.confirmed` — fired once the configured confirmation depth is reached
+- `payment.finalized` — fired once a deeper, final confirmation depth is reached, this is the point the server stops polling and assumes a payment can't or won't be statistically reverted, for merchants who want stronger reorg guarantees than `payment.confirmed` alone provides
+- `payment.orphaned` — fired if a previously confirmed transaction is reorganized out; the merchant decides how to react
+- `payment.finished` — fired once an invoice's received total first reaches the requested amount, aggregating across all transactions toward that invoice
 
-- `payment.received` — fired on detected funds, reporting received/total/expected amounts (so partial payments are visible)
-- `payment.confirmed` — fired once configured confirmation depth is reached
-- `payment.orphaned` — fired if a previously confirmed block is reorganized out; the merchant decides how to react
-
-Confirmation depth is configurable per token/network. Monitoring continues after initial confirmation (at a reduced frequency) to allow reorg detection.
-
+Both confirmation depths (`payment.confirmed` and `payment.finalized`) are configurable per token/network. Monitoring continues after initial confirmation, at a reduced frequency, to allow reorg detection through to finalization.
 ## Data / correctness principles
 
 - PostgreSQL, designed around ACID guarantees and idempotent operations — invoice creation, sweeps, and webhook dispatch are all built to be safely retryable without double-processing.

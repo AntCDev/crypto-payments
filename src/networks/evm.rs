@@ -98,7 +98,19 @@ const DEFAULT_PAYMENT_TOPIC0: &str =
 
 const NATIVE_TOKEN_SENTINEL: &str = "0x0000000000000000000000000000000000000000";
 
+const ERC20_TRANSFER_TOPIC0: &str =
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
+fn address_to_topic(addr_lc: &str) -> String {
+    format!("0x{:0>64}", addr_lc.trim_start_matches("0x"))
+}
+
+struct Erc20Transfer {
+    tx_hash: String,
+    token_lc: String,
+    to_lc: String,
+    amount: u128,
+}
 fn payment_topic0() -> &'static str {
     static TOPIC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TOPIC.get_or_init(|| {
@@ -394,7 +406,151 @@ impl EVMNetwork {
             .map_err(|e| format!("prune_seen_blocks({scope}): {e}"))?;
         Ok(())
     }
+    async fn get_erc20_transfers(
+        &self,
+        block_number: u64,
+        to_addresses: &[String],
+    ) -> Result<Vec<Erc20Transfer>, String> {
+        if to_addresses.is_empty() {
+            return Ok(vec![]);
+        }
+        let to_topics: Vec<String> = to_addresses.iter().map(|a| address_to_topic(a)).collect();
+        let block_hex = format!("0x{:x}", block_number);
 
+        let filter = serde_json::json!({
+            "fromBlock": block_hex,
+            "toBlock": block_hex,
+            "topics": [ERC20_TRANSFER_TOPIC0, serde_json::Value::Null, to_topics],
+        });
+
+        let logs = self.get_logs(filter).await?;
+        let mut out = Vec::new();
+
+        for log in logs {
+            if log.removed {
+                continue;
+            }
+            // Standard Transfer(address indexed from, address indexed to, uint256 value)
+            // has exactly 3 topics. Anything else shares topic0 by coincidence
+            // (or is a non-standard token) — not safe to interpret as a transfer.
+            if log.topics.len() != 3 {
+                continue;
+            }
+            let to_lc = match topic_to_address(&log.topics[2]) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let data = log.data.trim_start_matches("0x");
+            if data.len() < 64 {
+                continue; // malformed / non-uint256 payload, skip defensively
+            }
+            let amount = match hex_to_u128(&data[..64]) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            if amount == 0 {
+                continue; // some tokens emit zero-value Transfers, nothing to credit
+            }
+
+            out.push(Erc20Transfer {
+                tx_hash: log.transaction_hash.to_lowercase(),
+                token_lc: log.address.to_lowercase(),
+                to_lc,
+                amount,
+            });
+        }
+
+        Ok(out)
+    }
+
+    async fn apply_erc20_transfers(
+        &self,
+        pool: &PgPool,
+        block: &BlockView,
+        transfers: &[Erc20Transfer],
+        by_address: &HashMap<String, Vec<WatchedInvoice>>,
+    ) -> Result<(), String> {
+        for t in transfers {
+            let Some(invoices) = by_address.get(&t.to_lc) else { continue };
+            let amount = wei_to_decimal(t.amount)?;
+
+            for inv in invoices {
+                // Only credit invoices that expect exactly this token.
+                // None => native invoice, not this path at all.
+                let Some(expected_token) = inv.token_lc.as_deref() else { continue };
+                if expected_token != t.token_lc {
+                    continue;
+                }
+
+                if let Some(created) = inv.created_block {
+                    if (block.number as i64) < created {
+                        continue;
+                    }
+                }
+
+                let mut tx = pool.begin().await
+                    .map_err(|e| format!("apply_erc20_transfers begin tx: {e}"))?;
+
+                let inserted = sqlx::query(
+                    r#"
+        INSERT INTO payments
+            (invoice_id, tx_hash, amount, block_number, block_hash, confirmations, status)
+        VALUES ($1, $2, $3, $4, $5, 0, 'detected')
+        ON CONFLICT (invoice_id, tx_hash) DO NOTHING
+        "#,
+                )
+                    .bind(inv.invoice_id)
+                    .bind(&t.tx_hash)
+                    .bind(amount)
+                    .bind(block.number as i64)
+                    .bind(&block.hash)
+                    .execute(&mut *tx).await
+                    .map_err(|e| format!("insert erc20 payment: {e}"))?
+                    .rows_affected() == 1;
+
+                if inserted {
+                    println!(
+                        "[{}] detected {} of token {} -> {} (invoice {}, tx {}, block {})",
+                        self.network_name, t.amount, t.token_lc, t.to_lc,
+                        inv.invoice_id, t.tx_hash, block.number
+                    );
+
+                    let mut fields = Map::new();
+                    fields.insert("TokenAddress".into(), json!(t.token_lc));
+                    fields.insert("TxHash".into(), json!(t.tx_hash));
+                    fields.insert("AmountBaseUnits".into(), json!(amount.to_string()));
+                    fields.insert("BlockNumber".into(), json!(block.number));
+                    fields.insert("BlockHash".into(), json!(block.hash));
+                    fields.insert("Confirmations".into(), json!(0));
+
+                    enqueue_webhook(&mut tx, inv.invoice_id, "payment.detected", &t.tx_hash, fields).await?;
+                } else {
+                    sqlx::query(
+                        r#"
+            UPDATE payments
+               SET block_number = $2, block_hash = $3,
+                   status = CASE WHEN status = 'orphaned' THEN 'detected' ELSE status END,
+                   updated_at = now()
+             WHERE invoice_id = $1 AND tx_hash = $4
+               AND (block_hash <> $3 OR status = 'orphaned')
+            "#,
+                    )
+                        .bind(inv.invoice_id)
+                        .bind(block.number as i64)
+                        .bind(&block.hash)
+                        .bind(&t.tx_hash)
+                        .execute(&mut *tx).await
+                        .map_err(|e| format!("relocate erc20 payment: {e}"))?;
+                }
+
+                tx.commit().await
+                    .map_err(|e| format!("apply_erc20_transfers commit tx: {e}"))?;
+
+                self.recompute_invoice_totals(pool, inv.invoice_id, std::slice::from_ref(inv)).await?;
+            }
+        }
+        Ok(())
+    }
 
     // ── Who are we watching ──────────────────────────────────────────────────
 
@@ -407,8 +563,6 @@ impl EVMNetwork {
     /// 'paid' still needs its confirmation counter driven to FINAL_CONFIRMATIONS,
     /// and that must survive a process restart with an empty `self.pending`.
     ///
-    /// token_address IS NULL => native currency (ETH/MATIC/...). ERC-20s are
-    /// matched by Transfer logs in watch_logs, keyed on the exact token address.
     async fn load_watched_invoices(&self, pool: &PgPool) -> Result<Vec<WatchedInvoice>, String> {
         let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, rust_decimal::Decimal, i64, Option<i64>, Option<String>)>(
             r#"
@@ -502,17 +656,16 @@ impl EVMNetwork {
                 // so a restart after downtime still backfills, else at the tip.
                 let start = sqlx::query_scalar::<_, Option<i64>>(
                     r#"
-                    SELECT MIN(i.created_block)
-                      FROM invoices i
-                     WHERE i.network_type = $1 AND i.chain_ref = $2
-                       AND i.token_address IS NULL
-                       AND (
-                             (i.status = 'pending' AND i.expires_at > now())
-                          OR EXISTS (SELECT 1 FROM payments p
-                                      WHERE p.invoice_id = i.id
-                                        AND p.status IN ('detected','merchant_confirmed'))
-                       )
-                    "#,
+    SELECT MIN(i.created_block)
+      FROM invoices i
+     WHERE i.network_type = $1 AND i.chain_ref = $2
+       AND (
+             (i.status = 'pending' AND i.expires_at > now())
+          OR EXISTS (SELECT 1 FROM payments p
+                      WHERE p.invoice_id = i.id
+                        AND p.status IN ('detected','merchant_confirmed'))
+       )
+    "#,
                 )
                     .bind(NETWORK_TYPE).bind(self.chain_ref())
                     .fetch_one(pool).await
@@ -548,21 +701,26 @@ impl EVMNetwork {
         }
 
         let (mut last_block, mut last_hash) = cursor.unwrap();
-
         // 3. Apply new blocks, throttled so a long outage doesn't melt the RPC.
         //    We re-read tip each tick so catch-up happens over multiple ticks.
-        let target = std::cmp::min(tip, last_block + MAX_BLOCKS_PER_TICK as i64);
+        //    Cap one block below tip: the newest block is the one most likely to
+        //    have reached some providers and not others, so scanning right up to
+        //    tip invites avoidable quorum failures. refresh_confirmations still
+        //    counts confirmations against the live tip independently, so this
+        //    costs nothing in confirmation accuracy — it's purely about not
+        //    fighting propagation lag in the scan loop.
+        let scan_ceiling = (tip - 1).max(0);
+        let target = std::cmp::min(scan_ceiling, last_block + MAX_BLOCKS_PER_TICK as i64);
+
+        let watched_addresses: Vec<String> = by_address.keys().cloned().collect();
 
         let mut n = last_block + 1;
         while n <= target {
             let block = match self.get_block(n as u64, true).await? {
                 Some(b) => b,
-                None => break, // provider hasn't got it yet; try again next tick
+                None => break,
             };
 
-            // Linkage check. If the parent doesn't match what we applied last,
-            // a reorg happened *between* the check above and now — bail out and
-            // let the next tick's detect_fork_point deal with it properly.
             if !last_hash.is_empty() && block.parent_hash != last_hash {
                 println!(
                     "[{}] parent mismatch at block {} (expected parent {}, got {}), deferring to reorg handling",
@@ -572,6 +730,14 @@ impl EVMNetwork {
             }
 
             self.apply_block(pool, &block, &by_address).await?;
+
+            if !watched_addresses.is_empty() {
+                let erc20_transfers = self.get_erc20_transfers(n as u64, &watched_addresses).await?;
+                if !erc20_transfers.is_empty() {
+                    self.apply_erc20_transfers(pool, &block, &erc20_transfers, &by_address).await?;
+                }
+            }
+
             self.remember_block(pool, SCAN_SCOPE_ADDRESSES, &block).await?;
 
             last_hash = block.hash.clone();
@@ -762,17 +928,15 @@ impl EVMNetwork {
     ) -> Result<(), String> {
         for (tx_hash, to_lc, value) in &block.transfers {
             let Some(invoices) = by_address.get(to_lc) else { continue };
-
-            // A simple top-level value transfer that got included cannot have
-            // reverted, so we skip the receipt fetch here.
-            // TODO: native value can also arrive via a contract's internal call
-            //       (SELFDESTRUCT, a router forwarding ETH, a multisend). Those
-            //       are invisible to eth_getBlockByNumber and need
-            //       trace_block / debug_traceBlockByNumber. Add that behind a
-            //       per-chain "supports_traces" flag.
             let amount = wei_to_decimal(*value)?;
 
             for inv in invoices {
+                // This path is native-value only — a token invoice at this
+                // address must never be credited from a plain ETH transfer.
+                if inv.token_lc.is_some() {
+                    continue;
+                }
+
                 if let Some(created) = inv.created_block {
                     if (block.number as i64) < created {
                         continue;
@@ -1639,7 +1803,8 @@ impl EVMNetwork {
         // 3. Batched log search. Same per-tick budget as the address scanner so
         //  catch-up after downtime is spread over multiple ticks, split into
         //  provider-friendly getLogs ranges.
-        let target = std::cmp::min(tip, last_block + MAX_BLOCKS_PER_TICK as i64);
+        let scan_ceiling = (tip - 1).max(0);
+        let target = std::cmp::min(scan_ceiling, last_block + MAX_BLOCKS_PER_TICK as i64);
 
         let mut from = last_block + 1;
         while from <= target {
