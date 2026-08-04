@@ -16,14 +16,47 @@ Most existing self-hosted options are either narrowly scoped to a single chain, 
 
 It is also a learning project — a way to get hands-on with HD wallet derivation, chain-specific watching/confirmation logic, and the operational edge cases (reorgs, underpayment, idempotent webhook delivery) that any real payment system eventually has to deal with.
 
-### Compared to existing tools
 
-| Project | Scope | Notes |
-|---|---|---|
-| **BTCPay Server** | Bitcoin-focused | Mature, but not designed as a multichain/EVM/SOL-agnostic layer |
-| **SHKeeper** | Handful of tokens | Minimal, limited network/token coverage |
-| **PayRam** | Multichain, partially closed | Core logic is not fully open; ran into stability issues in local testing |
-| **This project** | EVM (+ L2s), Solana, Esplora (Bitcoin-style UTXO) | Fully open source, unified architecture across networks |
+### Compared to existing tools (as of 2026-08-04)
+
+The self-hosted / open-source crypto payment processor space is real but still sparse, and it clusters strongly along one axis:
+
+- **Open-source + self-hosted** projects almost always choose the **non-custodial** path (merchant or end-user holds keys; the server only watches, generates addresses from xpubs, or coordinates via smart contracts). This keeps the compliance surface small and is elegant from a pure “don’t touch the money” engineering perspective.
+- Projects that are willing to take **full custody** (generate and hold the private keys / signing authority for deposit addresses and any batching contracts) almost always become **SaaS / commercial gateways**. The operational, legal, and security burden of custody is high enough that the natural business model is to charge for the service rather than publish the full stack.
+
+This project deliberately sits in the remaining empty square:
+
+**Fully custodial + fully open source + self-hosted + multi-network (EVM + L2s, Solana, Esplora-style UTXO) + multi-tenant capable (with hard KYB gate) + deliberately easy to extend or replace pieces.**
+
+That combination is uncommon. Most comparable software lands in one of the other three cells of the matrix.
+
+| Project                                                                                                             | Custody model                                                         | Open source / self-hosted                                  | Network coverage (high level)                                                                                                                             | Notes / differentiation vs this project                                                                                                                                                                                                                                                                           |
+|---------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------|------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **BTCPay Server**                                                                                                   | Non-custodial                                                         | Fully open, mature, self-hosted                            | Bitcoin-first (on-chain + Lightning). Community plugins for a few others (LTC, XMR, limited ETH/USDT). Cross-chain plugins exist but are not first-class. | The gold standard for Bitcoin. Excellent multi-tenant support, plugins, accounting, POS apps. Not designed as a unified multi-chain (especially EVM + Solana) invoicing layer with shared orchestration, dual payment paths, and network-optimized detection.                                                     |
+| **SHKeeper**                                                                                                        | Non-custodial                                                         | Fully open (GPL-3.0), self-hosted (k3s/Helm)               | Broad: BTC (+ LN), ETH + many EVM L2s, SOL, TRX, XMR, XRP, TON, AVAX, etc. + multi-chain USDT/USDC/DAI/PYUSD. Actively expanded through 2025–2026.        | Solid multi-coin self-hosted gateway with CMS plugins and unique-address invoices. Non-custodial by design. Does not expose the same network-agnostic orchestrator + dual-path (naive HD QR + smart/WalletConnect with contract or memo) model, nor the same emphasis on operator-replaceable detection backends. |
+| **PayRam**                                                                                                          | Non-custodial (smart-contract coordinated; no deposit keys on server) | Self-hosted, open scripts + components, stablecoin-focused | EVM (ETH, Base, Polygon, …), Tron, Bitcoin, TON; Solana in progress. Strong USDT/USDC/PYUSD focus.                                                        | Modern stablecoin-era alternative to BTCPay. Easy one-command deploy, white-label/operator mode, “no keys on server” architecture. Non-custodial by design. Different trade-offs from a fully custodial system that can own sweeping policy, batching contracts, and internal ledger semantics.                   |
+| **Bitcart**                                                                                                         | Non-custodial                                                         | Fully open (MIT), self-hosted                              | BTC, LTC, BCH, XMR, ETH, TRX, USDT and more (~50 coins claimed)                                                                                           | Mature Python stack with good developer tooling and Lightning support. Again non-custodial.                                                                                                                                                                                                                       |
+| Other notable self-hosted / OSS efforts (XPayLabs-style, neverpay, DV.net Merchant, various lighter gateways, etc.) | Almost all non-custodial                                              | Varying degrees of openness                                | Usually EVM + TRON or a smaller set                                                                                                                       | Most are either single-purpose, lighter-weight, or still non-custodial. Few combine full multi-tenant custody + unified orchestrator across EVM/Solana/UTXO with the dual-path UX described below.                                                                                                                |
+| Commercial / SaaS processors (NOWPayments, Inqud, CoinGate, BitPay, Coinbase Commerce, etc.)                        | Custodial (or hybrid)                                                 | Closed                                                     | Broad                                                                                                                                                     | Exactly the model this project is an alternative to: you get the convenience of multi-chain invoices and webhooks, but you do not own the keys, the data, or the code, and you accept their fee schedule, ToS, and deplatforming risk.                                                                            |
+
+**Why the custodial + open-source combination is rare (and why this project chooses it)**
+
+Engineers building open-source payment infrastructure usually prefer non-custodial designs for the same reasons most crypto software does: lower regulatory surface, no private-key custody risk on the server, and a cleaner “we only watch the chain” story. The moment you decide the operator *will* generate and hold keys (for HD deposit addresses, for a batching vault’s admin keys, for automated sweeping under configurable policies, etc.), you inherit real compliance and operational obligations. Most people who accept that burden then productize it as a hosted service.
+
+This project accepts the custodial model (see the top-level warnings and `COMPLIANCE.md`) because the merchant-facing product I actually want to run and offer looks like a normal payment processor: reliable “invoice paid” signals, dual payment options that work for both technical and non-technical payers, configurable confirmation/finality, under/over-payment handling, sweeps under operator policy, and the ability to run either solo or multi-tenant (with KYB required for the latter). Non-custodial designs are elegant; they are not always the best product shape when you are the one who has to support real merchants day-to-day.
+
+The architecture is built so that the custodial choice does not force every operator into the same implementation details:
+
+- The **orchestrator is network-agnostic**. It only knows token IDs, amounts, merchants, and invoices. Everything chain-shaped lives behind `NetworkClient` + `TokenHandler` traits.
+- EVM ships with a **CustodialPaymentVault** contract that enables the smart (WalletConnect) path and batching/sweep policies. Operators are free to deploy a different contract, change the event signature (config), or disable the vault entirely and run pure address watching.
+- Detection currently uses direct JSON-RPC calls (for learning and full control over quorum, reorg handling, cursor semantics, and idempotency). Because the network boundary is a trait, it is straightforward to:
+  - Swap an implementation for one built on popular crates,
+  - Run both side-by-side (e.g. a “reference” RPC path and a crate-based path),
+  - Or add entirely different backends.
+- Adding Solana Pay, Request Network, x402 (or any other protocol-level payment primitive) is the same shape of work: implement a `NetworkClient` (or a thin adapter) that understands that protocol’s detection/confirmation model, register the relevant token handlers, and the orchestrator and webhook layer continue to work unchanged. The same applies to future chains (TRON energy optimizations, etc.).
+
+In short: the project is opinionated about the *product* (custodial multi-network processor with dual paths and multi-tenant option) while remaining deliberately unopinionated about many of the *implementation* choices underneath. That is the gap it is trying to occupy relative to both the non-custodial OSS tools and the closed custodial SaaS products.
+
 
 ## Supported networks (in progress)
 
@@ -61,7 +94,7 @@ Signups are open, and unrelated third parties can register as merchants and rece
 Two ways to pay an invoice, by design:
 
 - **Naive QR** — a plain address QR code. Maximally compatible (many wallets fail to parse QR codes that embed token/network/memo metadata reliably), at the cost of requiring a sweep step from the deposit address to treasury.
-- **WalletConnect** — a direct connection to the user's wallet, allowing a single atomic transaction (e.g. a smart contract call on EVM, or a treasury transfer + memo on Solana) with no separate sweep required and no risk of user error on manual memo entry.
+- **WalletConnect** — a direct connection to the user's wallet, allowing a single atomic transaction (e.g. a smart contract call on EVM, or a treasury transfer carrying a reference key on Solana) with no separate sweep required and no risk of user error on manual identifier entry.
 
 The system is built to soft-prefer WalletConnect where available, while keeping the naive QR path fully functional as a fallback.
 
