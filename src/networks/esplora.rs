@@ -50,6 +50,11 @@ pub struct EsploraVout {
     pub scriptpubkey_address: Option<String>,
 }
 
+fn get_derivation_path(index: u32, is_testnet: bool) -> String {
+    let coin_type = if is_testnet { 1 } else { 0 };
+    format!("m/84'/{}'/0'/0/{}", coin_type, index)
+}
+
 // ==========================================
 // ### NETWORK IMPLEMENTATION ###
 // ==========================================
@@ -139,7 +144,7 @@ impl EsploraNetwork {
 
         let seed = mnemonic_parsed.to_seed("");
 
-        let path_str = self.get_derivation_path(index);
+        let path_str = get_derivation_path(index, self.is_testnet);
         let path: DerivationPath = path_str
             .parse()
             .map_err(|e| format!("Failed to parse derivation path: {}", e))?;
@@ -209,10 +214,7 @@ impl NetworkClient for EsploraNetwork {
         Ok((address, index, Some(reference)))
     }
 
-    fn get_derivation_path(&self, index: u32) -> String {
-        let coin_type = if self.is_testnet { 1 } else { 0 };
-        format!("m/84'/{}'/0'/0/{}", coin_type, index)
-    }
+
 
     fn validate_address(&self, address: &str) -> bool {
         match segwit::decode(address) {

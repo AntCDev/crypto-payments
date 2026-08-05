@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::networks::evm::derive_evm_address;
 
 #[derive(Deserialize)]
 pub struct SignUpMerchantRequest {
@@ -122,7 +123,11 @@ pub async fn signup_merchant_handler(
         }
     };
 
-    // 3. Hash password with Argon2id & API Secret with SHA-256
+    // 3. Derive EVM Wallet Address (Index 0)
+    let evm_address = derive_evm_address(&mnemonic_phrase, 0)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to derive EVM wallet: {e}")))?;
+
+    // 4. Hash password with Argon2id & API Secret with SHA-256
     let password_hash = hash_password(&payload.password)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -130,7 +135,7 @@ pub async fn signup_merchant_handler(
     let raw_api_secret = format!("sk_live_{}", Uuid::new_v4().simple());
     let api_key_secret_hash = hash_api_secret(&raw_api_secret);
 
-    // 4. Encrypt Webhook Secret (if provided) using AES-256-GCM
+    // 5. Encrypt Webhook Secret (if provided) using AES-256-GCM
     let (webhook_secret_str, webhook_encrypted, webhook_nonce) = match &payload.webhook_url {
         Some(_) => {
             let secret_str = format!("whsec_{}", Uuid::new_v4().simple());
@@ -141,11 +146,11 @@ pub async fn signup_merchant_handler(
         None => (None, None, None),
     };
 
-    // 5. Encrypt Mnemonic using AES-256-GCM
+    // 6. Encrypt Mnemonic using AES-256-GCM
     let (mnemonic_encrypted, mnemonic_nonce) = encrypt_data(master_key, mnemonic_phrase.as_bytes())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    // 6. Database Transaction
+    // 7. Database Transaction
     let mut tx = state.pool.begin().await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("DB Transaction error: {e}"))
     })?;
@@ -187,6 +192,20 @@ pub async fn signup_merchant_handler(
         .execute(&mut *tx)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed key material insertion: {e}")))?;
+
+    // Insert EVM Wallet Address into merchant_wallets table
+    sqlx::query!(
+        r#"
+        INSERT INTO merchant_wallets (merchant_id, network_type, address)
+        VALUES ($1, $2, $3)
+        "#,
+        merchant_id,
+        "evm",
+        evm_address.to_lowercase()
+    )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed EVM wallet insertion: {e}")))?;
 
     let default_networks = vec!["EVM", "SOL", "ESPLORA"];
     for net in default_networks {

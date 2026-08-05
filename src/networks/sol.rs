@@ -46,6 +46,11 @@ struct SolTokenAccountsValue {
     value: Vec<serde_json::Value>,
 }
 
+fn get_derivation_path(index: u32) -> String {
+    format!("m/44'/501'/{}'/0'", index)
+}
+
+
 // ==========================================
 // ### NETWORK IMPLEMENTATION ###
 // ==========================================
@@ -159,7 +164,7 @@ impl SolanaNetwork {
 
         let seed = mnemonic_parsed.to_seed("");
 
-        let path_str = self.get_derivation_path(index);
+        let path_str = get_derivation_path(index);
         let indices = parse_derivation_path(&path_str)?;
 
         type HmacSha512 = Hmac<Sha512>;
@@ -215,9 +220,6 @@ impl NetworkClient for SolanaNetwork {
         Ok((address, index, Some(reference)))
     }
 
-    fn get_derivation_path(&self, index: u32) -> String {
-        format!("m/44'/501'/{}'/0'", index)
-    }
 
     fn validate_address(&self, address: &str) -> bool {
         if address.len() < 32 || address.len() > 44 {

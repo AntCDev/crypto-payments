@@ -322,8 +322,8 @@ async fn main() {
         .expect("Failed to initialize database tables");
     println!(" Done.");
 
-    // 1. Instantiate the networks ONCE on load
-    let networks = Arc::new(networks::NetworkRegistry::from_env());
+    // 1. Instantiate the networks ONCE on load & spawn payment watchers
+    let networks = Arc::new(networks::NetworkRegistry::from_env(pool.clone()));
 
     // 2. Pass the singletons down to the token registry so handlers can clone the Arcs
     let registry = Arc::new(tokens::TokenRegistry::new(networks.clone()));

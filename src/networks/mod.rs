@@ -63,7 +63,7 @@ pub struct NetworkRegistry {
 }
 
 impl NetworkRegistry {
-    pub fn from_env() -> Self {
+    pub fn from_env(pool: PgPool) -> Self {
         println!("\n🌐 Initializing Network Registry...");
 
         // Safely fetch multi-URL strings (RPCs)
@@ -98,7 +98,6 @@ impl NetworkRegistry {
 
         // ---- EVM ----
         let mut evm = HashMap::new();
-        // Tuple format: (Chain ID, Network Name, RPC Env Key, Contract Env Key)
         let evm_configs = [
             (1, "Ethereum", "ETH_MAINNET_RPC_URLS", "ETH_MAINNET_CONTRACT_ADDRESS"),
             (8453, "Base", "BASE_MAINNET_RPC_URLS", "BASE_MAINNET_CONTRACT_ADDRESS"),
@@ -116,10 +115,16 @@ impl NetworkRegistry {
                     println!("    └─ Contract Address: ⚠️ None configured");
                 }
 
-                evm.insert(
-                    chain_id,
-                    Arc::new(evm::EVMNetwork::new(chain_id, urls, contract_address))
-                );
+                let network = Arc::new(evm::EVMNetwork::new(chain_id, urls, contract_address));
+                evm.insert(chain_id, network.clone());
+
+                // Spawn background payment watcher task
+                let pool_clone = pool.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = network.watch_payments(&pool_clone).await {
+                        eprintln!("❌ Error in EVM network (Chain ID: {}) watch_payments: {}", chain_id, err);
+                    }
+                });
             }
         }
 
@@ -133,7 +138,16 @@ impl NetworkRegistry {
 
         for (cluster, name) in sol_configs {
             if let Some(urls) = fetch_and_log_urls(name, cluster.env_prefix()) {
-                sol.insert(cluster, Arc::new(sol::SolanaNetwork::new(cluster, urls)));
+                let network = Arc::new(sol::SolanaNetwork::new(cluster, urls));
+                sol.insert(cluster, network.clone());
+
+                // Spawn background payment watcher task
+                let pool_clone = pool.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = network.watch_payments(&pool_clone).await {
+                        eprintln!("❌ Error in Solana network ({:?}) watch_payments: {}", cluster, err);
+                    }
+                });
             }
         }
 
@@ -145,9 +159,18 @@ impl NetworkRegistry {
             (BitcoinNetwork::Signet, "Bitcoin Signet"),
         ];
 
-        for (network, name) in bitcoin_configs {
-            if let Some(urls) = fetch_and_log_urls(name, network.env_prefix()) {
-                esplora.insert(network, Arc::new(esplora::EsploraNetwork::new(network, urls)));
+        for (network_type, name) in bitcoin_configs {
+            if let Some(urls) = fetch_and_log_urls(name, network_type.env_prefix()) {
+                let network = Arc::new(esplora::EsploraNetwork::new(network_type, urls));
+                esplora.insert(network_type, network.clone());
+
+                // Spawn background payment watcher task
+                let pool_clone = pool.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = network.watch_payments(&pool_clone).await {
+                        eprintln!("❌ Error in Bitcoin network ({:?}) watch_payments: {}", network_type, err);
+                    }
+                });
             }
         }
 
@@ -184,7 +207,6 @@ pub struct Amount(pub u128);
 #[async_trait]
 pub trait NetworkClient: Send + Sync {
     async fn get_derive_address(&self, pool: &PgPool, merchant_id: Uuid, invoice_id: Uuid, mnemonic: &str) -> Result<(String, u32, Option<String>), String>;
-    fn get_derivation_path(&self, index: u32) -> String;
     fn validate_address(&self, address: &str) -> bool;
     async fn get_native_balance(&self, address: &str) -> Result<Amount, String>;
     async fn get_token_balance(&self, token_address: &str, address: &str, decimals: u8) -> Result<Amount, String>;

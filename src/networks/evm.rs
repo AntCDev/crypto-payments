@@ -185,6 +185,37 @@ fn decode_payment_log(log: &Log) -> Result<PaymentEvent, String> {
     Ok(PaymentEvent { invoice_id, merchant_lc, token_lc, payer_lc, amount_requested, amount_received })
 }
 
+pub fn derive_evm_address(mnemonic: &str, index: u32) -> Result<String, String> {
+    let mnemonic_parsed = Mnemonic::parse(mnemonic)
+        .map_err(|e| format!("Invalid mnemonic: {}", e))?;
+
+    let seed = mnemonic_parsed.to_seed("");
+
+    let path_str = get_derivation_path(index);
+    let path: DerivationPath = path_str
+        .parse()
+        .map_err(|e| format!("Failed to parse derivation path: {}", e))?;
+
+    let child_xprv = XPrv::derive_from_path(&seed, &path)
+        .map_err(|e| format!("Failed to derive child key at path: {}", e))?;
+
+    let secret_key = child_xprv.private_key();
+    let public_key = secret_key.public_key();
+
+    let public_key_point = public_key.to_encoded_point(false);
+    let point_bytes = public_key_point.as_bytes();
+
+    let mut hasher = Keccak256::new();
+    hasher.update(&point_bytes[1..]);
+    let hash_result = hasher.finalize();
+
+    let address_bytes = &hash_result[12..];
+
+    Ok(format!("0x{}", hex::encode(address_bytes)))
+}
+fn get_derivation_path(index: u32) -> String {
+    format!("m/44'/60'/0'/0/{index}")
+}
 
 fn hex_to_u64(hex_str: &str) -> u64 {
     u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).unwrap_or(0)
@@ -672,13 +703,13 @@ impl EVMNetwork {
                     .map_err(|e| format!("cold start floor: {e}"))?
                     .unwrap_or(tip);
 
-                // -1 so the first block we actually process is `start`.
                 let from = (start - 1).max(0);
                 println!(
                     "[{}] no scan cursor, cold-starting at block {}",
                     self.network_name, from + 1
                 );
-                None.or(Some((from, String::new())))
+                self.save_cursor(pool, SCAN_SCOPE_ADDRESSES, from, "").await?;   // <-- add this
+                Some((from, String::new()))
             }
         };
 
@@ -1472,34 +1503,6 @@ impl EVMNetwork {
 
         Ok(Amount(raw_units))
     }
-    pub fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
-        let mnemonic_parsed = Mnemonic::parse(mnemonic)
-            .map_err(|e| format!("Invalid mnemonic: {}", e))?;
-
-        let seed = mnemonic_parsed.to_seed("");
-
-        let path_str = self.get_derivation_path(index);
-        let path: DerivationPath = path_str
-            .parse()
-            .map_err(|e| format!("Failed to parse derivation path: {}", e))?;
-
-        let child_xprv = XPrv::derive_from_path(&seed, &path)
-            .map_err(|e| format!("Failed to derive child key at path: {}", e))?;
-
-        let secret_key = child_xprv.private_key();
-        let public_key = secret_key.public_key();
-
-        let public_key_point = public_key.to_encoded_point(false);
-        let point_bytes = public_key_point.as_bytes();
-
-        let mut hasher = Keccak256::new();
-        hasher.update(&point_bytes[1..]);
-        let hash_result = hasher.finalize();
-
-        let address_bytes = &hash_result[12..];
-
-        Ok(format!("0x{}", hex::encode(address_bytes)))
-    }
 
     /// Fork detection for a SPARSE history. The logs scanner only anchors one
     /// header per getLogs chunk, so unlike detect_fork_point we can't demand a
@@ -1769,6 +1772,7 @@ impl EVMNetwork {
                     self.network_name,
                     from + 1
                 );
+                self.save_cursor(pool, SCAN_SCOPE_LOGS, from, "").await?;
                 Some((from, String::new()))
             }
         };
@@ -1873,15 +1877,11 @@ impl NetworkClient for EVMNetwork {
             .map_err(|e| format!("Failed to update merchant network index: {e}"))?;
 
         let index = row.next_index as u32;
-        let address = self.derive_address(mnemonic, index)?;
+        let address = derive_evm_address(mnemonic, index)?;
 
         let reference = format!("0x{}", hex::encode(invoice_id.as_bytes()));
 
         Ok((address, index, Some(reference)))
-    }
-
-    fn get_derivation_path(&self, index: u32) -> String {
-        format!("m/44'/60'/0'/0/{index}")
     }
 
     fn validate_address(&self, address: &str) -> bool {

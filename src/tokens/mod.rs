@@ -67,6 +67,7 @@ impl TokenRegistry {
         // Pass the networks registry forward to sub-modules
         eth::register(&mut registry, networks.clone());
         base::register(&mut registry, networks.clone());
+        base_sepolia::register(&mut registry, networks.clone());
 
         registry
     }
