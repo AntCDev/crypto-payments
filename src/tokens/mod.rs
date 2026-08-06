@@ -11,6 +11,7 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
 };
 pub mod eth;
+pub mod sepolia;
 pub mod base;
 pub mod base_sepolia;
 
@@ -66,6 +67,7 @@ impl TokenRegistry {
 
         // Pass the networks registry forward to sub-modules
         eth::register(&mut registry, networks.clone());
+        sepolia::register(&mut registry, networks.clone());
         base::register(&mut registry, networks.clone());
         base_sepolia::register(&mut registry, networks.clone());
 

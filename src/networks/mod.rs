@@ -103,6 +103,7 @@ impl NetworkRegistry {
             (8453, "Base", "BASE_MAINNET_RPC_URLS", "BASE_MAINNET_CONTRACT_ADDRESS"),
             (137, "Polygon", "POLYGON_MAINNET_RPC_URLS", "POLYGON_MAINNET_CONTRACT_ADDRESS"),
             (84532, "Base Sepolia", "BASE_SEPOLIA_RPC_URLS", "BASE_SEPOLIA_CONTRACT_ADDRESS"),
+            (11155111, "Sepolia", "SEPOLIA_RPC_URLS", "SEPOLIA_CONTRACT_ADDRESS"),
         ];
 
         for (chain_id, name, rpc_key, contract_key) in evm_configs {

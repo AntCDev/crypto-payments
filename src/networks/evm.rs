@@ -87,7 +87,7 @@ const SCAN_SCOPE_LOGS: &str = "logs";
 /// eth_getLogs range per request. Most providers cap somewhere between 1k and
 /// 10k blocks (and/or 10k results); 1000 is safe basically everywhere.
 /// TODO: per-provider config, and halve-and-retry on "response too large" errors.
-const MAX_LOG_BLOCK_RANGE: u64 = 1_000;
+const MAX_LOG_BLOCK_RANGE: u64 = 10;
 
 
 
@@ -1280,7 +1280,8 @@ impl EVMNetwork {
                 fields.insert("AmountRequested".into(), json!(inv.amount_requested));
                 fields.insert("Overpaid".into(), json!(new_status == "overpaid"));
 
-                enqueue_webhook(&mut tx, invoice_id, "payment.finished", &new_status.to_string(), fields).await?;
+                let dedupe_key = format!("{}:{}", invoice_id, new_status);
+                enqueue_webhook(&mut tx, invoice_id, "payment.finished", &dedupe_key, fields).await?;
 
                 tx.commit().await
                     .map_err(|e| format!("recompute_invoice_totals commit tx: {e}"))?;
