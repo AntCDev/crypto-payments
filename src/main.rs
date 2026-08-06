@@ -377,7 +377,7 @@ async fn main() {
     println!("\n==================================================");
     println!("⚡ Server booted up cleanly on http://{}", addr);
     if ip.is_unspecified() {
-        println!("🔗 Local access: http://localhost:{} (or http://127.0.0.1:{})", port, port);
+        println!("🔗 Local access: http://localhost:{}", port);
     }
     println!("==================================================\n");
 
