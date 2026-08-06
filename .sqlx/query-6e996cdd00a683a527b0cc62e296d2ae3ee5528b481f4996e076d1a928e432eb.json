@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO invoices (\n            merchant_id,\n            token_id,\n            amount_requested,\n            wallet_address,\n            wallet_index,\n            expires_at,\n            status,\n            data\n        )\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n        RETURNING id\n        ",
+  "query": "\n        INSERT INTO invoices (merchant_id, token_id, amount_requested, wallet_address, wallet_index, expires_at, status, data)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n        RETURNING id\n        ",
   "describe": {
     "columns": [
       {
@@ -31,5 +31,5 @@
       false
     ]
   },
-  "hash": "ac7a68c88de2cf5e5001157f3aefaf7577cd229f109a00c3f5e94515cecb91b8"
+  "hash": "6e996cdd00a683a527b0cc62e296d2ae3ee5528b481f4996e076d1a928e432eb"
 }

@@ -368,7 +368,11 @@ async fn main() {
         .parse()
         .expect("PORT must be a valid number");
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let ip: std::net::IpAddr = host.parse().expect("HOST must be a valid IP address");
+    let addr = std::net::SocketAddr::from((ip, port));
+    
+    // let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
 
     println!("\n==================================================");

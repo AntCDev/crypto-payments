@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO merchant_key_material (\n            merchant_id, key_family, encrypted_secret, encryption_nonce, encryption_version\n        )\n        VALUES ($1, $2, $3, $4, 1)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Bytea",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "de9c885a6e2e922326bbcb39681f145916b5bae1d64353429e33d276fbfc908c"
+}

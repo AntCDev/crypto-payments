@@ -1,0 +1,44 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cryptopay}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-cryptopay}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cryptopay}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Overrides whatever DATABASE_URL is in .env so it points at the
+      # `db` service name (Docker's internal DNS) instead of localhost.
+      DATABASE_URL: postgres://${POSTGRES_USER:-cryptopay}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-cryptopay}
+      # Must be 0.0.0.0 inside the container or the app is unreachable from
+      # outside it, even with the ports: mapping below. Docker's own network
+      # isolation + this explicit port mapping is what controls real exposure,
+      # so 0.0.0.0 here is safe and normal.
+      HOST: 0.0.0.0
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    depends_on:
+      db:
+        condition: service_healthy
+    # Drop a pre-built custom frontend here to override the baked-in one
+    # WITHOUT recompiling the Rust binary or touching the frontend source:
+    # volumes:
+    #   - ./my-custom-wwwroot:/app/wwwroot:ro
+
+volumes:
+  db-data:

@@ -1,0 +1,32 @@
+# Build artifacts (generated inside the image, not needed from host)
+target
+wwwroot
+frontend/node_modules
+frontend/dist
+frontend/dist-ssr
+
+# Secrets — never bake these into an image layer
+.env
+.env.*.local
+
+# VCS / IDE
+.git
+.gitignore
+.idea
+.vscode
+
+# Docker files themselves don't need to be in the context
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Large / irrelevant to the build
+*.jfif
+*.png
+*.jpg
+*.jpeg
+contract.sol
+COMPLIANCE.md
+LEDGER.md
+NETWORKS.md
+README.md
