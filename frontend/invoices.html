@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Complete payment</title>
+  <link rel="stylesheet" href="./src/style.css" />
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen p-4 md:p-8 antialiased">
+
+<div class="max-w-5xl mx-auto">
+
+  <!-- ============================ HEADER ============================ -->
+  <header class="mb-6 flex flex-wrap items-start justify-between gap-4">
+    <div>
+      <h1 class="text-2xl md:text-3xl font-extrabold text-emerald-400 tracking-tight">Complete payment</h1>
+      <p class="text-slate-400 text-sm mt-1">
+        Invoice <span id="hdr-invoice-id" class="font-mono text-slate-300">—</span>
+      </p>
+    </div>
+    <div class="text-right">
+      <span id="hdr-status"
+            class="inline-block px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider bg-slate-800 border border-slate-700 text-slate-400">
+        Loading
+      </span>
+      <p id="hdr-expiry" class="text-xs text-slate-500 mt-2 font-mono"></p>
+    </div>
+  </header>
+
+  <!-- ============================ ALERTS ============================ -->
+  <div id="error-box" class="hidden mb-6 p-4 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-400 text-sm"></div>
+  <div id="notice-box" class="hidden mb-6 p-4 rounded-lg bg-sky-500/10 border border-sky-500/30 text-sky-300 text-sm"></div>
+
+  <!-- ============================ LOADING ============================ -->
+  <div id="loading-state" class="bg-slate-800 rounded-2xl border border-slate-700/80 p-12 text-center text-slate-400 text-sm">
+    Loading invoice…
+  </div>
+
+  <!-- ============================ MAIN ============================ -->
+  <main id="invoice-view" class="hidden space-y-6">
+
+    <!-- ---------- Amount summary ---------- -->
+    <section class="bg-slate-800 rounded-2xl shadow-2xl border border-slate-700/80 p-6 md:p-8">
+      <div class="flex flex-wrap items-end justify-between gap-6">
+        <div>
+          <span class="block text-[10px] uppercase tracking-wider font-semibold text-slate-400 mb-1">Amount due</span>
+          <div class="flex items-baseline gap-2">
+            <span id="amount-due" class="text-4xl md:text-5xl font-extrabold text-slate-50 tabular-nums">—</span>
+            <span id="amount-symbol" class="text-xl font-bold text-emerald-400"></span>
+          </div>
+          <p id="amount-base-units" class="text-xs text-slate-500 font-mono mt-2"></p>
+        </div>
+
+        <div class="text-right space-y-1">
+          <div>
+            <span class="block text-[10px] uppercase tracking-wider font-semibold text-slate-400">Received so far</span>
+            <span id="amount-received" class="text-lg font-bold text-slate-200 tabular-nums">—</span>
+          </div>
+          <div>
+            <span class="block text-[10px] uppercase tracking-wider font-semibold text-slate-400">Network</span>
+            <span id="chain-label" class="text-sm font-mono text-slate-300">—</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- progress -->
+      <div class="mt-6">
+        <div class="h-2 w-full bg-slate-900 rounded-full overflow-hidden border border-slate-700/60">
+          <div id="progress-bar" class="h-full bg-emerald-500 transition-all duration-500" style="width:0%"></div>
+        </div>
+        <p id="progress-label" class="text-xs text-slate-500 mt-2"></p>
+      </div>
+    </section>
+
+    <!-- ---------- Two payment paths ---------- -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+
+      <!-- ============ PATH A: naive QR ============ -->
+      <section class="bg-slate-800 rounded-2xl shadow-2xl border border-slate-700/80 p-6 md:p-8">
+        <div class="flex items-center justify-between mb-1">
+          <h2 class="text-lg font-bold text-slate-100">Send to address</h2>
+          <span class="text-[10px] uppercase tracking-wider font-bold text-slate-500 border border-slate-700 rounded px-2 py-0.5">Works everywhere</span>
+        </div>
+        <p class="text-slate-400 text-xs leading-relaxed mb-5">
+          Scan with any wallet and send the exact amount above. The code contains only the address —
+          you still have to pick the token, the network and the amount yourself.
+        </p>
+
+        <!-- Naive QR: address string only, nothing else encoded. -->
+        <div class="bg-white rounded-xl p-4 flex items-center justify-center">
+          <canvas id="address-qr" class="block w-full max-w-[280px] h-auto"></canvas>
+        </div>
+
+        <div class="mt-5">
+          <span class="block text-[10px] uppercase tracking-wider font-semibold text-slate-400 mb-1">Deposit address</span>
+          <div class="flex gap-2">
+            <div id="wallet-address"
+                 class="flex-1 p-3 bg-slate-900 rounded-lg border border-slate-700 text-xs font-mono text-emerald-300 break-all select-all"></div>
+            <button id="copy-address-btn" type="button"
+                    class="shrink-0 px-3 rounded-lg border border-slate-700 bg-slate-900 text-xs font-semibold text-slate-300 hover:border-emerald-500 hover:text-emerald-400 transition-colors cursor-pointer">
+              Copy
+            </button>
+          </div>
+        </div>
+
+        <div id="reference-block" class="mt-4 hidden">
+          <span class="block text-[10px] uppercase tracking-wider font-semibold text-slate-400 mb-1">Payment reference</span>
+          <div id="payment-reference"
+               class="p-3 bg-slate-900 rounded-lg border border-slate-800 text-xs font-mono text-slate-300 break-all select-all"></div>
+        </div>
+
+        <p class="mt-5 text-[11px] leading-relaxed text-amber-300/80 bg-amber-500/10 border border-amber-500/25 rounded-lg p-3">
+          Send only <span id="warn-symbol" class="font-bold">this token</span> on
+          <span id="warn-chain" class="font-bold">this network</span>. Anything else is lost.
+        </p>
+      </section>
+
+      <!-- ============ PATH B: wallet connect ============ -->
+      <section class="bg-slate-800 rounded-2xl shadow-2xl border border-emerald-500/30 p-6 md:p-8 ring-1 ring-emerald-500/10">
+        <div class="flex items-center justify-between mb-1">
+          <h2 class="text-lg font-bold text-emerald-400">Pay from your wallet</h2>
+          <span class="text-[10px] uppercase tracking-wider font-bold text-emerald-400 border border-emerald-500/40 bg-emerald-500/10 rounded px-2 py-0.5">Recommended</span>
+        </div>
+        <p class="text-slate-400 text-xs leading-relaxed mb-5">
+          Your wallet fills in the token, the network and the exact amount for you, so there is nothing to
+          mistype and nothing to lose to the wrong chain. Use this if your wallet supports it.
+        </p>
+
+        <!-- step 1 -->
+        <div class="space-y-3">
+          <div class="flex items-start gap-3">
+            <span id="step-1-marker" class="mt-0.5 shrink-0 w-6 h-6 rounded-full border border-slate-600 text-slate-400 text-xs font-bold flex items-center justify-center">1</span>
+            <div class="flex-1">
+              <button id="btn-connect" type="button"
+                      class="w-full bg-emerald-500 hover:bg-emerald-600 active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed disabled:active:scale-100 text-slate-950 font-bold py-3 rounded-lg transition duration-200 shadow-lg cursor-pointer">
+                Connect wallet
+              </button>
+              <p id="connect-detail" class="text-[11px] text-slate-500 mt-1.5 font-mono break-all"></p>
+            </div>
+          </div>
+
+          <!-- step 2 -->
+          <div class="flex items-start gap-3">
+            <span id="step-2-marker" class="mt-0.5 shrink-0 w-6 h-6 rounded-full border border-slate-700 text-slate-600 text-xs font-bold flex items-center justify-center">2</span>
+            <div class="flex-1">
+              <button id="btn-approve" type="button" disabled
+                      class="w-full bg-slate-700 hover:bg-slate-600 active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed disabled:active:scale-100 text-slate-100 font-bold py-3 rounded-lg transition duration-200 cursor-pointer">
+                Check spending approval
+              </button>
+              <p id="approve-detail" class="text-[11px] text-slate-500 mt-1.5 font-mono break-all"></p>
+            </div>
+          </div>
+
+          <!-- step 3 -->
+          <div class="flex items-start gap-3">
+            <span id="step-3-marker" class="mt-0.5 shrink-0 w-6 h-6 rounded-full border border-slate-700 text-slate-600 text-xs font-bold flex items-center justify-center">3</span>
+            <div class="flex-1">
+              <button id="btn-send" type="button" disabled
+                      class="w-full bg-emerald-500 hover:bg-emerald-600 active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed disabled:active:scale-100 text-slate-950 font-bold py-3 rounded-lg transition duration-200 shadow-lg cursor-pointer">
+                Send payment
+              </button>
+              <p id="send-detail" class="text-[11px] text-slate-500 mt-1.5 font-mono break-all"></p>
+            </div>
+          </div>
+        </div>
+
+        <!-- wallet log -->
+        <div id="wallet-log"
+             class="hidden mt-5 p-3 bg-slate-900 rounded-lg border border-slate-800 text-[11px] font-mono text-slate-400 space-y-1 max-h-48 overflow-y-auto"></div>
+      </section>
+    </div>
+
+    <!-- ---------- Payment attempts ---------- -->
+    <section id="payments-section" class="hidden bg-slate-800 rounded-2xl shadow-2xl border border-slate-700/80 p-6 md:p-8">
+      <h2 class="text-lg font-bold text-slate-100 mb-4">Payments seen on chain</h2>
+      <div id="payments-list" class="space-y-2"></div>
+    </section>
+
+  </main>
+</div>
+
+<script type="module" src="/src/evm.ts"></script>
+</body>
+</html>

@@ -71,6 +71,68 @@ struct BlockRecord {
 
 
 
+// Providers cap how many values you can put in one topic slot. 100 is safe; chunk the watched-address list.
+const MAX_TOPIC_ADDRESSES: usize = 100;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScanRange {
+    from: i64,
+    to: Option<i64>,
+}
+
+impl ScanRange {
+    fn contains(&self, n: i64) -> bool {
+        n >= self.from && self.to.map_or(true, |t| n <= t)
+    }
+    fn end_or(&self, ceiling: i64) -> i64 {
+        self.to.unwrap_or(ceiling)
+    }
+}
+
+/// Sort + coalesce. Adjacent ranges (`prev.to + 1 == r.from`) merge too, so we
+/// never pay for a jump to save a single block. An open-ended range swallows
+/// everything after it.
+fn merge_ranges(mut ranges: Vec<ScanRange>) -> Vec<ScanRange> {
+    ranges.sort_by_key(|r| (r.from, r.to.unwrap_or(i64::MAX)));
+    let mut out: Vec<ScanRange> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        match out.last_mut() {
+            Some(prev) if prev.to.map_or(true, |t| r.from <= t + 1) => {
+                prev.to = match (prev.to, r.to) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None, // either side open => merged range is open
+                };
+            }
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// Given the block we'd *like* to scan next, return the block we should
+/// actually scan: `want` if it's inside a live range, otherwise the start of
+/// the next range after it, or `None` if there's nothing left to watch at all.
+/// `plan` must be sorted ascending (merge_ranges guarantees that).
+fn plan_next_block(plan: &[ScanRange], want: i64) -> Option<i64> {
+    for r in plan {
+        if r.contains(want) {
+            return Some(want);
+        }
+        if r.from > want {
+            return Some(r.from);
+        }
+    }
+    None
+}
+
+/// Last block of the range `n` currently sits in — the point at which we should
+/// stop walking forward and consider jumping.
+fn plan_range_end(plan: &[ScanRange], n: i64, ceiling: i64) -> i64 {
+    plan.iter()
+        .find(|r| r.contains(n))
+        .map(|r| r.end_or(ceiling))
+        .unwrap_or(ceiling)
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tunables. All of these become per-merchant / per-chain config later.
@@ -110,6 +172,7 @@ struct Erc20Transfer {
     token_lc: String,
     to_lc: String,
     amount: u128,
+    pub block_hash: String
 }
 fn payment_topic0() -> &'static str {
     static TOPIC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -355,6 +418,103 @@ impl EVMNetwork {
         Ok(Some((bn, bh)))
     }
 
+    // ── Building the plan ──────────────────────────────────────────────────────────
+    /// The set of block ranges that can possibly contain money we care about.
+    ///
+    /// Two kinds of interest:
+    ///
+    ///   * **Live invoice** (`pending`/`underpaid`, not yet expired):
+    ///     `[min(created_block, first_payment_block) .. open]`. Open-ended
+    ///     because expiry is a wall-clock time in the future; when it passes,
+    ///     the invoice simply stops coming back from this query and the range
+    ///     disappears. No `expires_block` column, no per-chain block-time math.
+    ///
+    ///   * **Dead invoice with payments still counting confirmations**:
+    ///     `[first_payment_block .. last_payment_block + FINAL_CONFIRMATIONS + 1]`.
+    ///     We don't need these blocks to *detect* anything (confirmations are
+    ///     computed off the DB against the live tip), but scanning them keeps
+    ///     the `network_seen_blocks` anchors dense enough for the reorg
+    ///     detector to unwind a payment that gets orphaned.
+    ///
+    /// Everything between those ranges is dead space and gets skipped by
+    /// cursor jump instead of block-by-block RPC grinding.
+    async fn load_scan_plan(&self, pool: &PgPool, tip: i64) -> Result<Vec<ScanRange>, String> {
+        let rows = sqlx::query_as::<_, (Option<i64>, bool, Option<i64>, Option<i64>)>(
+            r#"
+            SELECT i.created_block,
+                   (i.status IN ('pending','underpaid') AND i.expires_at > now()) AS live,
+                   MIN(p.block_number) AS first_pay,
+                   MAX(p.block_number) AS last_pay
+              FROM invoices i
+              LEFT JOIN payments p
+                     ON p.invoice_id = i.id
+                    AND p.status IN ('detected','merchant_confirmed')
+             WHERE i.network_type = $1
+               AND i.chain_ref   = $2
+               AND (
+                     (i.status IN ('pending','underpaid') AND i.expires_at > now())
+                  OR EXISTS (SELECT 1 FROM payments p2
+                              WHERE p2.invoice_id = i.id
+                                AND p2.status IN ('detected','merchant_confirmed'))
+                   )
+             GROUP BY i.id, i.created_block, i.status, i.expires_at
+            "#,
+        )
+            .bind(NETWORK_TYPE)
+            .bind(self.chain_ref())
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("load_scan_plan: {e}"))?;
+
+        let mut ranges = Vec::with_capacity(rows.len());
+        for (created_block, live, first_pay, last_pay) in rows {
+            let anchor = [created_block, first_pay].into_iter().flatten().min();
+
+            if live {
+                // Still collectable => scan right up to the tip.
+                ranges.push(ScanRange {
+                    from: anchor.unwrap_or(tip).max(0),
+                    to: None,
+                });
+            } else if let (Some(first), Some(last)) = (first_pay, last_pay) {
+                // Expired or settled, but confirmations still in flight.
+                ranges.push(ScanRange {
+                    from: first.max(0),
+                    to: Some(last + FINAL_CONFIRMATIONS + 1),
+                });
+            }
+            // else: expired, never paid, nothing in flight -> no interest at all.
+        }
+
+        Ok(merge_ranges(ranges))
+    }
+
+    /// Park the cursor on `to_block` without scanning anything between here and
+    /// there. We still fetch and remember the header, because the next tick's
+    /// parent-hash continuity check and the reorg detector both need an anchor
+    /// they can compare against.
+    async fn fast_forward_cursor(
+        &self,
+        pool: &PgPool,
+        scope: &str,
+        to_block: i64,
+    ) -> Result<(i64, String), String> {
+        let anchor = self
+            .get_block(to_block as u64, false)
+            .await?
+            .ok_or_else(|| format!("fast_forward_cursor: block {to_block} unavailable"))?;
+
+        self.remember_block(pool, scope, &anchor).await?;
+        self.save_cursor(pool, scope, to_block, &anchor.hash).await?;
+
+        println!(
+            "[{}] {} scanner skipped ahead to block {} (no watched invoice in between)",
+            self.network_name, scope, to_block
+        );
+        Ok((to_block, anchor.hash))
+    }
+
+
     // ── Scan state ───────────────────────────────────────────────────────────
 
     async fn load_cursor(&self, pool: &PgPool, scope: &str) -> Result<Option<(i64, String)>, String> {
@@ -436,62 +596,6 @@ impl EVMNetwork {
             .execute(pool).await
             .map_err(|e| format!("prune_seen_blocks({scope}): {e}"))?;
         Ok(())
-    }
-    async fn get_erc20_transfers(
-        &self,
-        block_number: u64,
-        to_addresses: &[String],
-    ) -> Result<Vec<Erc20Transfer>, String> {
-        if to_addresses.is_empty() {
-            return Ok(vec![]);
-        }
-        let to_topics: Vec<String> = to_addresses.iter().map(|a| address_to_topic(a)).collect();
-        let block_hex = format!("0x{:x}", block_number);
-
-        let filter = serde_json::json!({
-            "fromBlock": block_hex,
-            "toBlock": block_hex,
-            "topics": [ERC20_TRANSFER_TOPIC0, serde_json::Value::Null, to_topics],
-        });
-
-        let logs = self.get_logs(filter).await?;
-        let mut out = Vec::new();
-
-        for log in logs {
-            if log.removed {
-                continue;
-            }
-            // Standard Transfer(address indexed from, address indexed to, uint256 value)
-            // has exactly 3 topics. Anything else shares topic0 by coincidence
-            // (or is a non-standard token) — not safe to interpret as a transfer.
-            if log.topics.len() != 3 {
-                continue;
-            }
-            let to_lc = match topic_to_address(&log.topics[2]) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            let data = log.data.trim_start_matches("0x");
-            if data.len() < 64 {
-                continue; // malformed / non-uint256 payload, skip defensively
-            }
-            let amount = match hex_to_u128(&data[..64]) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            if amount == 0 {
-                continue; // some tokens emit zero-value Transfers, nothing to credit
-            }
-
-            out.push(Erc20Transfer {
-                tx_hash: log.transaction_hash.to_lowercase(),
-                token_lc: log.address.to_lowercase(),
-                to_lc,
-                amount,
-            });
-        }
-
-        Ok(out)
     }
 
     async fn apply_erc20_transfers(
@@ -583,8 +687,18 @@ impl EVMNetwork {
         Ok(())
     }
 
-    // ── Who are we watching ──────────────────────────────────────────────────
+    // ── Who are we watching ──────────────────────────────────────────────────────────
 
+    /// Changed vs the old version: `i.status = 'pending'` became
+    /// `i.status IN ('pending','underpaid')`.
+    ///
+    /// That was the bug where partially-paid invoices vanished. Sequence was:
+    /// partial payment lands -> recompute_invoice_totals writes status
+    /// 'underpaid' -> that payment eventually reaches 'system_confirmed' ->
+    /// both arms of the WHERE go false -> the invoice stops being watched even
+    /// though it's unexpired and still owed money. The rest of the top-up never
+    /// gets credited.
+    ///
     /// Everything with an open interest on this chain:
     ///   - still-pending, unexpired invoices (we're waiting for money), OR
     ///   - invoices with at least one payment that hasn't reached
@@ -593,7 +707,6 @@ impl EVMNetwork {
     /// The second clause is the restart-safety bit: an invoice that already went
     /// 'paid' still needs its confirmation counter driven to FINAL_CONFIRMATIONS,
     /// and that must survive a process restart with an empty `self.pending`.
-    ///
     async fn load_watched_invoices(&self, pool: &PgPool) -> Result<Vec<WatchedInvoice>, String> {
         let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, rust_decimal::Decimal, i64, Option<i64>, Option<String>)>(
             r#"
@@ -612,7 +725,7 @@ impl EVMNetwork {
      WHERE i.network_type = $1
        AND i.chain_ref   = $2
        AND (
-             (i.status = 'pending' AND i.expires_at > now())
+             (i.status IN ('pending','underpaid') AND i.expires_at > now())
           OR EXISTS (SELECT 1 FROM payments p
                       WHERE p.invoice_id = i.id
                         AND p.status IN ('detected','merchant_confirmed'))
@@ -643,6 +756,74 @@ impl EVMNetwork {
             .collect())
     }
 
+    // ── Batched ERC-20 log fetch ──────────────────────────────────────────────────────────
+
+    /// One `eth_getLogs` per *chunk* instead of one per block. On the free tier
+    /// with MAX_LOG_BLOCK_RANGE = 10 that's a 10x cut in RPC calls on the
+    /// address scanner, which is most of why catch-up was so slow.
+    ///
+    /// Keyed by block number; `block_hash` is carried on each transfer so the
+    /// caller can drop logs that belong to a sibling block if the chain moved
+    /// under us mid-chunk.
+    async fn get_erc20_transfers_range(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        to_addresses: &[String],
+    ) -> Result<HashMap<u64, Vec<Erc20Transfer>>, String> {
+        let mut out: HashMap<u64, Vec<Erc20Transfer>> = HashMap::new();
+        if to_addresses.is_empty() {
+            return Ok(out);
+        }
+
+        for addr_chunk in to_addresses.chunks(MAX_TOPIC_ADDRESSES) {
+            let to_topics: Vec<String> = addr_chunk.iter().map(|a| address_to_topic(a)).collect();
+
+            let filter = serde_json::json!({
+                "fromBlock": format!("0x{:x}", from_block),
+                "toBlock":   format!("0x{:x}", to_block),
+                "topics": [ERC20_TRANSFER_TOPIC0, serde_json::Value::Null, to_topics],
+            });
+
+            for log in self.get_logs(filter).await? {
+                if log.removed {
+                    continue;
+                }
+                // Standard Transfer(address,address,uint256) has exactly 3 topics.
+                if log.topics.len() != 3 {
+                    continue;
+                }
+                let to_lc = match topic_to_address(&log.topics[2]) {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+                let data = log.data.trim_start_matches("0x");
+                if data.len() < 64 {
+                    continue;
+                }
+                let amount = match hex_to_u128(&data[..64]) {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+                if amount == 0 {
+                    continue;
+                }
+
+                out.entry(hex_to_u64(&log.block_number))
+                    .or_default()
+                    .push(Erc20Transfer {
+                        tx_hash: log.transaction_hash.to_lowercase(),
+                        token_lc: log.address.to_lowercase(),
+                        to_lc,
+                        amount,
+                        block_hash: log.block_hash.to_lowercase(),
+                    });
+            }
+        }
+
+        Ok(out)
+    }
+
     // ── The service loop ─────────────────────────────────────────────────────
 
     pub async fn watch_addresses(&self, pool: &PgPool) -> Result<(), String> {
@@ -668,121 +849,182 @@ impl EVMNetwork {
     async fn tick_addresses(&self, pool: &PgPool) -> Result<(), String> {
         let watched = self.load_watched_invoices(pool).await?;
         let tip = self.get_block_number().await? as i64;
+        let scan_ceiling = (tip - 1).max(0);
+        let plan = self.load_scan_plan(pool, tip).await?;
 
-        // Address -> invoices. Same deposit address *can* legitimately show up
-        // twice (address reuse across invoices for the same merchant), so this
-        // is a multimap, and a matching tx credits every invoice on it.
-        // TODO: once addresses are strictly single-use, collapse to a HashMap
-        //       and hard-error on duplicates instead of silently double-crediting.
         let mut by_address: HashMap<String, Vec<WatchedInvoice>> = HashMap::new();
         for w in &watched {
             by_address.entry(w.address_lc.clone()).or_default().push(w.clone());
         }
 
-        // 1. Where do we resume from?
+        // 1. Where do we resume from? Cold start floors at the plan's first
+        //    interesting block (or the tip if there's nothing to watch).
         let mut cursor = match self.load_cursor(pool, SCAN_SCOPE_ADDRESSES).await? {
-            Some((n, h)) => Some((n, h)),
+            Some(c) => c,
             None => {
-                // Cold start. Begin at the oldest open invoice's creation block
-                // so a restart after downtime still backfills, else at the tip.
-                let start = sqlx::query_scalar::<_, Option<i64>>(
-                    r#"
-    SELECT MIN(i.created_block)
-      FROM invoices i
-     WHERE i.network_type = $1 AND i.chain_ref = $2
-       AND (
-             (i.status = 'pending' AND i.expires_at > now())
-          OR EXISTS (SELECT 1 FROM payments p
-                      WHERE p.invoice_id = i.id
-                        AND p.status IN ('detected','merchant_confirmed'))
-       )
-    "#,
-                )
-                    .bind(NETWORK_TYPE).bind(self.chain_ref())
-                    .fetch_one(pool).await
-                    .map_err(|e| format!("cold start floor: {e}"))?
-                    .unwrap_or(tip);
-
-                let from = (start - 1).max(0);
+                let from = plan
+                    .first()
+                    .map(|r| (r.from - 1).max(0))
+                    .unwrap_or(scan_ceiling);
                 println!(
                     "[{}] no scan cursor, cold-starting at block {}",
-                    self.network_name, from + 1
+                    self.network_name,
+                    from + 1
                 );
-                self.save_cursor(pool, SCAN_SCOPE_ADDRESSES, from, "").await?;   // <-- add this
-                Some((from, String::new()))
+                self.save_cursor(pool, SCAN_SCOPE_ADDRESSES, from, "").await?;
+                (from, String::new())
             }
         };
 
-        // 2. Reorg check + unwind, before we apply anything new.
-        if let Some((last_block, last_hash)) = cursor.clone() {
+        // 2. Reorg check + unwind, before we apply anything new. (unchanged)
+        {
+            let (last_block, last_hash) = cursor.clone();
             if !last_hash.is_empty() {
-                if let Some(fork_point) = self.detect_fork_point(pool, last_block, &last_hash).await? {
+                if let Some(fork_point) =
+                    self.detect_fork_point(pool, last_block, &last_hash).await?
+                {
                     if fork_point < last_block {
                         println!(
-                            "[{}] reorg detected: cursor was {} , rewinding to {}",
+                            "[{}] reorg detected: cursor was {}, rewinding to {}",
                             self.network_name, last_block, fork_point
                         );
                         self.handle_reorg(pool, fork_point, &watched).await?;
-                        let fork_hash = self.our_hash_at(pool, SCAN_SCOPE_ADDRESSES, fork_point).await?.unwrap_or_default();
-                        cursor = Some((fork_point, fork_hash));
-                        self.save_cursor(pool, SCAN_SCOPE_ADDRESSES, fork_point, &cursor.as_ref().unwrap().1).await?;
+                        let fork_hash = self
+                            .our_hash_at(pool, SCAN_SCOPE_ADDRESSES, fork_point)
+                            .await?
+                            .unwrap_or_default();
+                        self.save_cursor(pool, SCAN_SCOPE_ADDRESSES, fork_point, &fork_hash)
+                            .await?;
+                        cursor = (fork_point, fork_hash);
                     }
                 }
             }
         }
 
-        let (mut last_block, mut last_hash) = cursor.unwrap();
-        // 3. Apply new blocks, throttled so a long outage doesn't melt the RPC.
-        //    We re-read tip each tick so catch-up happens over multiple ticks.
-        //    Cap one block below tip: the newest block is the one most likely to
-        //    have reached some providers and not others, so scanning right up to
-        //    tip invites avoidable quorum failures. refresh_confirmations still
-        //    counts confirmations against the live tip independently, so this
-        //    costs nothing in confirmation accuracy — it's purely about not
-        //    fighting propagation lag in the scan loop.
-        let scan_ceiling = (tip - 1).max(0);
-        let target = std::cmp::min(scan_ceiling, last_block + MAX_BLOCKS_PER_TICK as i64);
+        let (mut last_block, mut last_hash) = cursor;
 
-        let watched_addresses: Vec<String> = by_address.keys().cloned().collect();
-
-        let mut n = last_block + 1;
-        while n <= target {
-            let block = match self.get_block(n as u64, true).await? {
-                Some(b) => b,
-                None => break,
-            };
-
-            if !last_hash.is_empty() && block.parent_hash != last_hash {
-                println!(
-                    "[{}] parent mismatch at block {} (expected parent {}, got {}), deferring to reorg handling",
-                    self.network_name, n, last_hash, block.parent_hash
-                );
-                break;
+        // 3. Skip dead space *before* spending any budget.
+        match plan_next_block(&plan, last_block + 1) {
+            None => {
+                // Nothing to watch at or after the cursor. Don't let scan debt
+                // accumulate while we're idle — park on the ceiling so the next
+                // invoice starts from "now" instead of from wherever we stopped
+                // days ago. This is the "no active invoices => don't poll" case.
+                if scan_ceiling > last_block {
+                    let (b, h) = self
+                        .fast_forward_cursor(pool, SCAN_SCOPE_ADDRESSES, scan_ceiling)
+                        .await?;
+                    last_block = b;
+                    last_hash = h;
+                }
+                self.refresh_confirmations(pool, tip, &watched).await?;
+                self.prune_seen_blocks(pool, SCAN_SCOPE_ADDRESSES, last_block).await?;
+                return Ok(());
             }
-
-            self.apply_block(pool, &block, &by_address).await?;
-
-            if !watched_addresses.is_empty() {
-                let erc20_transfers = self.get_erc20_transfers(n as u64, &watched_addresses).await?;
-                if !erc20_transfers.is_empty() {
-                    self.apply_erc20_transfers(pool, &block, &erc20_transfers, &by_address).await?;
+            Some(n) if n > last_block + 1 => {
+                let jump_to = (n - 1).min(scan_ceiling);
+                if jump_to > last_block {
+                    let (b, h) = self
+                        .fast_forward_cursor(pool, SCAN_SCOPE_ADDRESSES, jump_to)
+                        .await?;
+                    last_block = b;
+                    last_hash = h;
                 }
             }
-
-            self.remember_block(pool, SCAN_SCOPE_ADDRESSES, &block).await?;
-
-            last_hash = block.hash.clone();
-            last_block = n;
-            self.save_cursor(pool, SCAN_SCOPE_ADDRESSES, last_block, &last_hash).await?;
-            n += 1;
+            _ => {}
         }
 
-        // 4. Recount confirmations against the *current* tip and promote.
-        //    Doing this off the DB rather than off the just-scanned blocks means
-        //    an invoice re-registered after a crash immediately picks up its real
-        //    confirmation count instead of restarting from 0.
-        self.refresh_confirmations(pool, tip, &watched).await?;
+        // 4. Apply new blocks, chunked, budget-capped.
+        let watched_addresses: Vec<String> = by_address.keys().cloned().collect();
+        let mut scanned: u64 = 0;
+        let mut n = last_block + 1;
 
+        'outer: while scanned < MAX_BLOCKS_PER_TICK && n <= scan_ceiling {
+            let range_end = plan_range_end(&plan, n, scan_ceiling);
+            let budget_end = n + (MAX_BLOCKS_PER_TICK - scanned) as i64 - 1;
+            let chunk_end = *[
+                scan_ceiling,
+                range_end,
+                budget_end,
+                n + MAX_LOG_BLOCK_RANGE as i64 - 1,
+            ]
+                .iter()
+                .min()
+                .unwrap();
+
+            // One getLogs for the whole chunk.
+            let mut erc20_by_block = self
+                .get_erc20_transfers_range(n as u64, chunk_end as u64, &watched_addresses)
+                .await?;
+
+            let mut m = n;
+            while m <= chunk_end {
+                let block = match self.get_block(m as u64, true).await? {
+                    Some(b) => b,
+                    None => break 'outer, // provider lagging the tip
+                };
+
+                if !last_hash.is_empty() && block.parent_hash != last_hash {
+                    println!(
+                        "[{}] parent mismatch at block {} (expected parent {}, got {}), deferring to reorg handling",
+                        self.network_name, m, last_hash, block.parent_hash
+                    );
+                    break 'outer;
+                }
+
+                self.apply_block(pool, &block, &by_address).await?;
+
+                if let Some(transfers) = erc20_by_block.remove(&(m as u64)) {
+                    // Drop anything that came from a sibling block: the getLogs
+                    // and the getBlock are separate round trips, so a reorg can
+                    // land between them. Whatever we drop here gets picked up on
+                    // the rescan the parent-mismatch/reorg path triggers.
+                    let transfers: Vec<Erc20Transfer> = transfers
+                        .into_iter()
+                        .filter(|t| t.block_hash == block.hash)
+                        .collect();
+                    if !transfers.is_empty() {
+                        self.apply_erc20_transfers(pool, &block, &transfers, &by_address)
+                            .await?;
+                    }
+                }
+
+                self.remember_block(pool, SCAN_SCOPE_ADDRESSES, &block).await?;
+                last_hash = block.hash.clone();
+                last_block = m;
+                self.save_cursor(pool, SCAN_SCOPE_ADDRESSES, last_block, &last_hash).await?;
+
+                scanned += 1;
+                m += 1;
+            }
+
+            n = chunk_end + 1;
+
+            // Walked off the end of a range? Jump to the next one rather than
+            // grinding through the gap.
+            if n > range_end {
+                match plan_next_block(&plan, n) {
+                    Some(next_from) if next_from > n => {
+                        let jump_to = (next_from - 1).min(scan_ceiling);
+                        if jump_to > last_block {
+                            let (b, h) = self
+                                .fast_forward_cursor(pool, SCAN_SCOPE_ADDRESSES, jump_to)
+                                .await?;
+                            last_block = b;
+                            last_hash = h;
+                            n = last_block + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        }
+
+        // 5. Confirmations off the DB against the live tip. (unchanged)
+        self.refresh_confirmations(pool, tip, &watched).await?;
         self.prune_seen_blocks(pool, SCAN_SCOPE_ADDRESSES, last_block).await?;
         Ok(())
     }
@@ -1733,54 +1975,34 @@ impl EVMNetwork {
 
     async fn tick_logs(&self, pool: &PgPool, contract_lc: &str) -> Result<(), String> {
         let watched = self.load_watched_invoices(pool).await?;
-
-        // Payment logs carry the invoice UUID natively (bytes16 identifier), so
-        // unlike the address scanner this map is keyed by id — no multimap needed.
-        let by_id: HashMap<Uuid, WatchedInvoice> = watched
-            .iter()
-            .map(|w| (w.invoice_id, w.clone()))
-            .collect();
+        let by_id: HashMap<Uuid, WatchedInvoice> =
+            watched.iter().map(|w| (w.invoice_id, w.clone())).collect();
 
         let tip = self.get_block_number().await? as i64;
+        let scan_ceiling = (tip - 1).max(0);
+        let plan = self.load_scan_plan(pool, tip).await?;
 
-        // 1. Where do we resume from?
-        let cursor = match self.load_cursor(pool, SCAN_SCOPE_LOGS).await? {
-            Some(c) => Some(c),
+        // 1. Resume point.
+        let mut cursor = match self.load_cursor(pool, SCAN_SCOPE_LOGS).await? {
+            Some(c) => c,
             None => {
-                let start = sqlx::query_scalar::<_, Option<i64>>(
-                    r#"
-                SELECT MIN(i.created_block)
-                  FROM invoices i
-                 WHERE i.network_type = $1 AND i.chain_ref = $2
-                   AND (
-                         (i.status = 'pending' AND i.expires_at > now())
-                      OR EXISTS (SELECT 1 FROM payments p
-                                  WHERE p.invoice_id = i.id
-                                    AND p.status IN ('detected','merchant_confirmed'))
-                   )
-                "#,
-                )
-                    .bind(NETWORK_TYPE)
-                    .bind(self.chain_ref())
-                    .fetch_one(pool)
-                    .await
-                    .map_err(|e| format!("logs cold start floor: {e}"))?
-                    .unwrap_or(tip);
-
-                let from = (start - 1).max(0);
+                let from = plan
+                    .first()
+                    .map(|r| (r.from - 1).max(0))
+                    .unwrap_or(scan_ceiling);
                 println!(
                     "[{}] no logs scan cursor, cold-starting at block {}",
                     self.network_name,
                     from + 1
                 );
                 self.save_cursor(pool, SCAN_SCOPE_LOGS, from, "").await?;
-                Some((from, String::new()))
+                (from, String::new())
             }
         };
 
-        // 2. Reorg check + unwind, before applying anything new.
-        let mut cursor = cursor;
-        if let Some((last_block, last_hash)) = cursor.clone() {
+        // 2. Reorg check + unwind (sparse detector). (unchanged)
+        {
+            let (last_block, last_hash) = cursor.clone();
             if !last_hash.is_empty() {
                 if let Some(fork_point) = self
                     .detect_fork_point_sparse(pool, SCAN_SCOPE_LOGS, last_block, &last_hash)
@@ -1797,39 +2019,69 @@ impl EVMNetwork {
                             .await?
                             .unwrap_or_default();
                         self.save_cursor(pool, SCAN_SCOPE_LOGS, fork_point, &fork_hash).await?;
-                        cursor = Some((fork_point, fork_hash));
+                        cursor = (fork_point, fork_hash);
                     }
                 }
             }
         }
 
-        let (mut last_block, _) = cursor.unwrap();
+        let (mut last_block, _) = cursor;
 
-        // 3. Batched log search. Same per-tick budget as the address scanner so
-        //  catch-up after downtime is spread over multiple ticks, split into
-        //  provider-friendly getLogs ranges.
-        let scan_ceiling = (tip - 1).max(0);
-        let target = std::cmp::min(scan_ceiling, last_block + MAX_BLOCKS_PER_TICK as i64);
+        // 3. Skip dead space before spending budget.
+        match plan_next_block(&plan, last_block + 1) {
+            None => {
+                if scan_ceiling > last_block {
+                    let (b, _) = self
+                        .fast_forward_cursor(pool, SCAN_SCOPE_LOGS, scan_ceiling)
+                        .await?;
+                    last_block = b;
+                }
+                self.refresh_confirmations(pool, tip, &watched).await?;
+                self.prune_seen_blocks(pool, SCAN_SCOPE_LOGS, last_block).await?;
+                return Ok(());
+            }
+            Some(n) if n > last_block + 1 => {
+                let jump_to = (n - 1).min(scan_ceiling);
+                if jump_to > last_block {
+                    let (b, _) = self
+                        .fast_forward_cursor(pool, SCAN_SCOPE_LOGS, jump_to).await?;
+                    last_block = b;
+                }
+            }
+            _ => {}
+        }
 
+        // 4. Batched log search inside the plan.
+        let mut scanned: u64 = 0;
         let mut from = last_block + 1;
-        while from <= target {
-            let to = std::cmp::min(from + MAX_LOG_BLOCK_RANGE as i64 - 1, target);
+
+        while scanned < MAX_BLOCKS_PER_TICK && from <= scan_ceiling {
+            let range_end = plan_range_end(&plan, from, scan_ceiling);
+            let budget_end = from + (MAX_BLOCKS_PER_TICK - scanned) as i64 - 1;
+            let to = *[
+                scan_ceiling,
+                range_end,
+                budget_end,
+                from + MAX_LOG_BLOCK_RANGE as i64 - 1,
+            ]
+                .iter()
+                .min()
+                .unwrap();
 
             let filter = serde_json::json!({
-            "address": contract_lc,
-            "topics": [payment_topic0()],
-            "fromBlock": format!("0x{:x}", from),
-            "toBlock": format!("0x{:x}", to),
-        });
+                "address": contract_lc,
+                "topics": [payment_topic0()],
+                "fromBlock": format!("0x{:x}", from),
+                "toBlock":   format!("0x{:x}", to),
+            });
             let logs = self.get_logs(filter).await?;
 
-            // Anchor: the header of the chunk's last block. This is what the
-            // sparse fork detector compares against next tick. Fetched AFTER
-            // the logs on purpose — if a reorg lands between the two calls,
-            // the anchor won't match canonical next tick and we rewind/rescan.
+            // Anchor fetched AFTER the logs on purpose: a reorg landing between
+            // the two calls leaves an anchor that won't match canonical next
+            // tick, so we rewind and rescan.
             let anchor = match self.get_block(to as u64, false).await? {
                 Some(b) => b,
-                None => break, // provider lagging the tip; retry next tick
+                None => break, // provider lagging the tip
             };
 
             for log in &logs {
@@ -1838,14 +2090,32 @@ impl EVMNetwork {
 
             self.remember_block(pool, SCAN_SCOPE_LOGS, &anchor).await?;
             self.save_cursor(pool, SCAN_SCOPE_LOGS, to, &anchor.hash).await?;
+
+            scanned += (to - from + 1) as u64;
             last_block = to;
             from = to + 1;
+
+            if from > range_end {
+                match plan_next_block(&plan, from) {
+                    Some(next_from) if next_from > from => {
+                        let jump_to = (next_from - 1).min(scan_ceiling);
+                        if jump_to > last_block {
+                            let (b, _) = self
+                                .fast_forward_cursor(pool, SCAN_SCOPE_LOGS, jump_to).await?;
+                            last_block = b;
+                            from = last_block + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
         }
 
-        // 4. Confirmations off the DB against the current tip — identical
-        //  machinery to the native path, payments rows are payments rows.
+        // 5. Confirmations off the DB against the current tip. (unchanged)
         self.refresh_confirmations(pool, tip, &watched).await?;
-
         self.prune_seen_blocks(pool, SCAN_SCOPE_LOGS, last_block).await?;
         Ok(())
     }

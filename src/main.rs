@@ -350,6 +350,8 @@ async fn main() {
         .route("/api/tokens", get(api::watcher::list_tokens_handler))
         .route("/api/invoices", post(api::invoices::create_invoice_handler))
         .route("/api/merchants", post(api::merchants::signup_merchant_handler))
+        .route("/invoice", get(api::invoices::invoice_redirect_handler))
+        .route("/api/invoices/{id}", get(api::invoices::get_invoice_handler))
 
         // Inspection / Test routes
         .route("/api/test/tokens", get(api::tests::list_tokens_test_handler))
