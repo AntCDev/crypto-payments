@@ -43,7 +43,7 @@ impl TokenHandler for BaseHandler {
         let merchant_mnemonic = "test test test test test test test test test test test junk";
 
         let (deposit_address, derived_wallet_index, payment_reference) = self.network
-            .get_derive_address(pool, merchant_id, invoice_id, merchant_mnemonic)
+            .get_derive_address(pool, merchant_id, invoice_id, merchant_mnemonic, None)
             .await
             .map_err(|e| format!("Address derivation failed: {e}"))?;
 

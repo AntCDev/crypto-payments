@@ -14,6 +14,7 @@ pub mod eth;
 pub mod sepolia;
 pub mod base;
 pub mod base_sepolia;
+mod sol_devnet;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PaymentDetails {

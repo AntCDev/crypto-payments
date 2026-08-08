@@ -14,6 +14,9 @@ use hmac::{Hmac, KeyInit, Mac}; // Added KeyInit here
 use sha2::{Sha256, Sha512, Digest};
 use sqlx::PgPool;
 
+use bip39::Mnemonic;
+use curve25519_dalek::edwards::CompressedEdwardsY;
+
 // ==========================================
 // ### PRIVATE RPC STRUCTS ###
 // ==========================================
@@ -44,6 +47,149 @@ struct SolBalanceValue {
 #[derive(Deserialize)]
 struct SolTokenAccountsValue {
     value: Vec<serde_json::Value>,
+}
+
+
+type HmacSha512 = Hmac<Sha512>;
+const SOLANA_HARDENED_OFFSET: u32 = 0x8000_0000;
+const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+const PDA_MARKER: &[u8] = b"ProgramDerivedAddress";
+
+
+
+// ---------- derivation path ----------
+
+/// Phantom/Solflare-style hardened path: m/44'/501'/{index}'/0'
+fn get_solana_derivation_path(index: u32) -> String {
+    format!("m/44'/501'/{}'/0'", index)
+}
+
+/// SLIP-0010 only supports hardened derivation for ed25519, so every
+/// segment must end in `'`. Returns the raw (unhardened) u32 for each segment.
+fn parse_hardened_path(path: &str) -> Result<Vec<u32>, String> {
+    path.trim_start_matches("m/")
+        .split('/')
+        .map(|segment| {
+            if !segment.ends_with('\'') {
+                return Err(format!(
+                    "SLIP-0010 ed25519 requires hardened segments, got: {}",
+                    segment
+                ));
+            }
+            segment
+                .trim_end_matches('\'')
+                .parse::<u32>()
+                .map_err(|_| format!("Invalid path segment: {}", segment))
+        })
+        .collect()
+}
+
+// ---------- SLIP-0010 ed25519 key derivation ----------
+
+fn slip10_master_key(seed: &[u8]) -> ([u8; 32], [u8; 32]) {
+    let mut mac = HmacSha512::new_from_slice(b"ed25519 seed")
+        .expect("HMAC accepts a key of any size");
+    mac.update(seed);
+    let result = mac.finalize().into_bytes();
+
+    let mut key = [0u8; 32];
+    let mut chain_code = [0u8; 32];
+    key.copy_from_slice(&result[0..32]);
+    chain_code.copy_from_slice(&result[32..64]);
+    (key, chain_code)
+}
+
+fn slip10_derive_child(key: &[u8; 32], chain_code: &[u8; 32], index: u32) -> ([u8; 32], [u8; 32]) {
+    let hardened_index = index | SOLANA_HARDENED_OFFSET;
+    let mut mac = HmacSha512::new_from_slice(chain_code)
+        .expect("HMAC accepts a key of any size");
+    mac.update(&[0u8]); // ed25519 SLIP-0010: 0x00 || private_key || ser32(index)
+    mac.update(key);
+    mac.update(&hardened_index.to_be_bytes());
+    let result = mac.finalize().into_bytes();
+
+    let mut child_key = [0u8; 32];
+    let mut child_chain_code = [0u8; 32];
+    child_key.copy_from_slice(&result[0..32]);
+    child_chain_code.copy_from_slice(&result[32..64]);
+    (child_key, child_chain_code)
+}
+
+/// Walks m/44'/501'/{index}'/0' via SLIP-0010 and returns the ed25519 signing key.
+fn derive_solana_signing_key(mnemonic: &str, index: u32) -> Result<SigningKey, String> {
+    let mnemonic_parsed = Mnemonic::parse(mnemonic).map_err(|e| format!("Invalid mnemonic: {}", e))?;
+    let seed = mnemonic_parsed.to_seed("");
+
+    let path_str = get_solana_derivation_path(index);
+    let segments = parse_hardened_path(&path_str)?;
+
+    let (mut key, mut chain_code) = slip10_master_key(&seed);
+    for segment in segments {
+        let (child_key, child_chain_code) = slip10_derive_child(&key, &chain_code, segment);
+        key = child_key;
+        chain_code = child_chain_code;
+    }
+
+    Ok(SigningKey::from_bytes(&key))
+}
+
+/// Derives the base58-encoded wallet (owner) address for a given index.
+fn derive_solana_address(mnemonic: &str, index: u32) -> Result<String, String> {
+    let signing_key = derive_solana_signing_key(mnemonic, index)?;
+    let public_key_bytes = signing_key.verifying_key().to_bytes();
+    Ok(bs58::encode(public_key_bytes).into_string())
+}
+
+// ---------- ATA / PDA derivation (no solana-* crates) ----------
+
+fn decode_pubkey(address: &str) -> Result<[u8; 32], String> {
+    let bytes = bs58::decode(address)
+        .into_vec()
+        .map_err(|e| format!("Invalid base58 address '{}': {}", address, e))?;
+    bytes
+        .try_into()
+        .map_err(|_| format!("Address '{}' is not a valid 32-byte pubkey", address))
+}
+
+/// A candidate PDA is only valid if it does NOT lie on the ed25519 curve.
+fn is_on_curve(bytes: &[u8; 32]) -> bool {
+    CompressedEdwardsY(*bytes).decompress().is_some()
+}
+
+/// Standalone reimplementation of `Pubkey::find_program_address`.
+fn find_program_address(seeds: &[&[u8]], program_id: &[u8; 32]) -> Result<([u8; 32], u8), String> {
+    for bump in (0..=255u8).rev() {
+        let mut hasher = Sha256::new();
+        for seed in seeds {
+            hasher.update(seed);
+        }
+        hasher.update(&[bump]);
+        hasher.update(program_id);
+        hasher.update(PDA_MARKER);
+        let hash = hasher.finalize();
+
+        let mut candidate = [0u8; 32];
+        candidate.copy_from_slice(&hash);
+
+        if !is_on_curve(&candidate) {
+            return Ok((candidate, bump));
+        }
+    }
+    Err("Unable to find a valid program derived address".to_string())
+}
+
+/// Derives the Associated Token Account address for `owner_address` + `mint_address`.
+fn derive_associated_token_address(owner_address: &str, mint_address: &str) -> Result<String, String> {
+    let owner_bytes = decode_pubkey(owner_address)?;
+    let mint_bytes = decode_pubkey(mint_address)?;
+    let token_program_bytes = decode_pubkey(TOKEN_PROGRAM_ID)?;
+    let associated_token_program_bytes = decode_pubkey(ASSOCIATED_TOKEN_PROGRAM_ID)?;
+
+    let seeds: [&[u8]; 3] = [&owner_bytes, &token_program_bytes, &mint_bytes];
+    let (ata_bytes, _bump) = find_program_address(&seeds, &associated_token_program_bytes)?;
+
+    Ok(bs58::encode(ata_bytes).into_string())
 }
 
 fn get_derivation_path(index: u32) -> String {
@@ -158,46 +304,6 @@ impl SolanaNetwork {
         }
     }
 
-    pub fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
-        let mnemonic_parsed = bip39::Mnemonic::parse(mnemonic)
-            .map_err(|e| format!("Invalid mnemonic: {}", e))?;
-
-        let seed = mnemonic_parsed.to_seed("");
-
-        let path_str = get_derivation_path(index);
-        let indices = parse_derivation_path(&path_str)?;
-
-        type HmacSha512 = Hmac<Sha512>;
-        let mut mac = HmacSha512::new_from_slice(b"ed25519 seed")
-            .map_err(|e| format!("HMAC initialization failed: {}", e))?;
-        mac.update(&seed);
-        let hmac_result = mac.finalize().into_bytes();
-
-        let mut secret_key: [u8; 32] = hmac_result[0..32].try_into().unwrap();
-        let mut chain_code: [u8; 32] = hmac_result[32..64].try_into().unwrap();
-
-        for idx in indices {
-            if idx < 0x8000_0000 {
-                return Err("SLIP-0010 Ed25519 only supports hardened derivation paths".to_string());
-            }
-
-            let mut mac = HmacSha512::new_from_slice(&chain_code)
-                .map_err(|e| format!("HMAC initialization failed: {}", e))?;
-
-            mac.update(&[0x00]);
-            mac.update(&secret_key);
-            mac.update(&idx.to_be_bytes());
-
-            let result = mac.finalize().into_bytes();
-            secret_key.copy_from_slice(&result[0..32]);
-            chain_code.copy_from_slice(&result[32..64]);
-        }
-
-        let signing_key = SigningKey::from_bytes(&secret_key);
-        let verifying_key = signing_key.verifying_key();
-
-        Ok(bs58::encode(verifying_key.to_bytes()).into_string())
-    }
 }
 
 #[async_trait]
@@ -205,19 +311,40 @@ impl NetworkClient for SolanaNetwork {
     // --- WALLET METHODS ---
     async fn get_derive_address(
         &self,
-        _pool: &PgPool,
-        _merchant_id: Uuid,
+        pool: &PgPool,
+        merchant_id: Uuid,
         invoice_id: Uuid,
         mnemonic: &str,
+        token_address: Option<&str>,
     ) -> Result<(String, u32, Option<String>), String> {
-        // Solana is an account-based architecture, so like EVM, it does not suffer from UTXO address gaps.
-        // Keeping your index 0 logic layout intact.
-        let index = 0;
-        let address = self.derive_address(mnemonic, index)?;
+        // Same custodial index-tracking pattern as your BTC implementation
+        let row = sqlx::query!(
+        r#"
+        INSERT INTO merchant_network_indices (merchant_id, network, account_index, next_index)
+        VALUES ($1, $2, 0, 1)
+        ON CONFLICT (merchant_id, network, account_index)
+        DO UPDATE SET
+            next_index = merchant_network_indices.next_index + 1,
+            updated_at = CURRENT_TIMESTAMP
+        RETURNING next_index
+        "#,
+        merchant_id,
+        self.network_name
+    )
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("Failed to update merchant network index: {}", e))?;
+
+        let index = (row.next_index - 1) as u32;
+        let wallet_address = derive_solana_address(mnemonic, index)?;
+
+        let deposit_address = match token_address {
+            Some(mint) => derive_associated_token_address(&wallet_address, mint)?,
+            None => wallet_address,
+        };
 
         let reference = format!("0x{}", hex::encode(invoice_id.as_bytes()));
-
-        Ok((address, index, Some(reference)))
+        Ok((deposit_address, index, Some(reference)))
     }
 
 

@@ -1,5 +1,5 @@
-use crate::networks::evm::EVMNetwork;
-use crate::networks::{NetworkClient, NetworkRegistry};
+use crate::networks::sol::SolanaNetwork;
+use crate::networks::{NetworkClient, NetworkRegistry, SolanaCluster};
 use crate::tokens::{decrypt_data, PaymentDetails, TokenHandler, TokenRegistry};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
@@ -13,62 +13,62 @@ pub struct TokenConfig {
     pub name: &'static str,
     pub detail: &'static str,
     pub info: &'static str,
-    pub token_address: Option<&'static str>, // None for native ETH
+    pub token_address: Option<&'static str>, // None for native SOL
     pub decimals: u8,
     pub required_confirmations: i32,
 }
 
-// Token configuration list for Ethereum Sepolia
-pub const SEPOLIA_TOKENS: &[TokenConfig] = &[
+// Token configuration list for Solana Devnet
+pub const DEVNET_TOKENS: &[TokenConfig] = &[
     TokenConfig {
-        id: "USDC_SEPOLIA",
+        id: "USDC_DEVNET",
         name: "USDC",
-        detail: "(Sepolia)",
-        info: "USDC stablecoin on the Ethereum Sepolia testnet.",
-        token_address: Some("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"),
+        detail: "(SOL) (Devnet)",
+        info: "USDC stablecoin on the Solana Devnet.",
+        token_address: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
         decimals: 6,
         required_confirmations: 5,
     },
     TokenConfig {
-        id: "USDT_SEPOLIA",
+        id: "USDT_DEVNET",
         name: "USDT",
-        detail: "(Sepolia)",
-        info: "Tether USD stablecoin on the Ethereum Sepolia testnet.",
-        token_address: Some("0x8d412FD0bc5d826615065B931171Eed10F5AF266"),
+        detail: "(SOL) (Devnet)",
+        info: "Tether USD stablecoin on the Solana Devnet.",
+        token_address: Some("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"),
         decimals: 6,
         required_confirmations: 5,
     },
     TokenConfig {
-        id: "DAI_SEPOLIA",
-        name: "DAI",
-        detail: "(Sepolia)",
-        info: "DAI stablecoin on the Ethereum Sepolia testnet.",
-        token_address: Some("0xFF34B3d4Aee8ddCd6F9AFFFB6Fe49bD371b8a357"),
-        decimals: 18,
+        id: "USDS_DEVNET",
+        name: "USDS",
+        detail: "(SOL) (Devnet)",
+        info: "USDS stablecoin on the Solana Devnet.",
+        token_address: Some("FILL_ME_IN_USDS_MINT_ADDRESS"),
+        decimals: 6,
         required_confirmations: 5,
     },
     TokenConfig {
-        id: "ETH_SEPOLIA",
-        name: "ETH",
-        detail: "(Sepolia)",
-        info: "Native Ethereum coin on the Sepolia testnet.",
+        id: "SOL_DEVNET",
+        name: "SOL",
+        detail: "(SOL) (Devnet)",
+        info: "Native Solana coin on the Devnet.",
         token_address: None,
-        decimals: 18,
+        decimals: 9,
         required_confirmations: 5,
     },
 ];
 
 pub fn register(registry: &mut TokenRegistry, networks: Arc<NetworkRegistry>) {
-    let network = match networks.evm_chain(11155111) {
+    let network = match networks.sol_cluster(SolanaCluster::Devnet) {
         Some(net) => net,
         None => {
-            println!("   ❌ Sepolia (chain_id 11155111) not configured");
+            println!("   ❌ Solana Devnet not configured");
             return;
         }
     };
 
-    for config in SEPOLIA_TOKENS {
-        let handler = SepoliaHandler {
+    for config in DEVNET_TOKENS {
+        let handler = DevnetHandler {
             network: Arc::clone(&network),
             config: config.clone(),
         };
@@ -84,13 +84,13 @@ pub fn register(registry: &mut TokenRegistry, networks: Arc<NetworkRegistry>) {
     }
 }
 
-pub struct SepoliaHandler {
-    network: Arc<EVMNetwork>,
+pub struct DevnetHandler {
+    network: Arc<SolanaNetwork>,
     config: TokenConfig,
 }
 
 #[async_trait]
-impl TokenHandler for SepoliaHandler {
+impl TokenHandler for DevnetHandler {
     fn token_id(&self) -> &str {
         self.config.id
     }
@@ -139,26 +139,28 @@ impl TokenHandler for SepoliaHandler {
             .map_err(|e| format!("Invalid UTF-8 sequence in decrypted mnemonic: {e}"))?;
 
         // 4. Derive wallet address and payment reference using decrypted mnemonic
+        // Extract token address for DB assignment
+        let token_address = self.config.token_address.as_ref().map(ToString::to_string);
+
         let (deposit_address, derived_wallet_index, payment_reference) = self
             .network
-            .get_derive_address(pool, merchant_id, invoice_id, &merchant_mnemonic, None)
+            .get_derive_address(pool, merchant_id, invoice_id, &merchant_mnemonic, token_address.as_deref())
             .await
             .map_err(|e| format!("Address derivation failed: {e}"))?;
 
         let expires_at = Utc::now() + Duration::minutes(30);
 
-        // Extract token address for DB assignment
-        let token_address = self.config.token_address.as_ref().map(ToString::to_string);
 
-        let current_block = self
+        // NOTE: adjust this to whatever SolanaNetwork exposes for the current
+        // slot height (e.g. get_current_slot()) if the method name differs.
+        let current_slot = self
             .network
             .get_current_block()
             .await
-            .map_err(|e| format!("Failed to fetch current block: {e}"))? as i64; // adjust type to match column
+            .map_err(|e| format!("Failed to fetch current slot: {e}"))? as i64; // adjust type to match column
 
-        let network_type = "evm";
-        let chain_ref = "11155111";
-
+        let network_type = "solana";
+        let chain_ref = "devnet";
 
         // 5. Update invoice record with derived address details and configuration metadata
         sqlx::query!(
@@ -186,7 +188,7 @@ impl TokenHandler for SepoliaHandler {
             self.config.required_confirmations as i16,
             network_type,
             chain_ref,
-            current_block,
+            current_slot,
             invoice_id
         )
             .execute(pool)
@@ -195,7 +197,7 @@ impl TokenHandler for SepoliaHandler {
 
         Ok(PaymentDetails {
             invoice_id,
-            network: "sepolia".to_string(),
+            network: "devnet".to_string(),
             deposit_address,
             token_address,
             decimals: self.config.decimals,
@@ -206,7 +208,7 @@ impl TokenHandler for SepoliaHandler {
     }
 
     async fn cancel_payment(&self, _pool: &PgPool, invoice_id: Uuid) -> Result<(), String> {
-        println!("SepoliaHandler::cancel_payment({invoice_id}) for token: {}", self.config.id);
+        println!("DevnetHandler::cancel_payment({invoice_id}) for token: {}", self.config.id);
         Ok(())
     }
 }

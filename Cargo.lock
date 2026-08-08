@@ -2173,6 +2173,7 @@ dependencies = [
  "bip39",
  "bs58",
  "chrono",
+ "curve25519-dalek",
  "dotenvy",
  "ed25519-dalek",
  "futures",
