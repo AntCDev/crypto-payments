@@ -72,6 +72,7 @@ impl TokenRegistry {
         base::register(&mut registry, networks.clone());
         base_sepolia::register(&mut registry, networks.clone());
 
+        sol_devnet::register(&mut registry, networks.clone());
         registry
     }
 

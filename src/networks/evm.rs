@@ -2119,6 +2119,65 @@ impl EVMNetwork {
         self.prune_seen_blocks(pool, SCAN_SCOPE_LOGS, last_block).await?;
         Ok(())
     }
+
+    async fn ensure_merchant_wallets(&self, pool: &PgPool) -> Result<(), String> {
+        let master_key_hex = std::env::var("MASTER_KEY")
+            .map_err(|_| "MASTER_KEY environment variable not set".to_string())?;
+
+        let master_key_vec = hex::decode(&master_key_hex)
+            .map_err(|_| "MASTER_KEY must be a valid hex string".to_string())?;
+
+        let master_key: &[u8; 32] = master_key_vec
+            .as_slice()
+            .try_into()
+            .map_err(|_| "MASTER_KEY must be exactly 32 bytes".to_string())?;
+
+        // Find merchants missing an EVM wallet record
+        let uninitialized_merchants = sqlx::query!(
+            r#"
+            SELECT m.id, km.encrypted_secret, km.encryption_nonce
+            FROM merchants m
+            JOIN merchant_key_material km ON m.id = km.merchant_id
+            WHERE km.key_family = 'bip39'
+              AND NOT EXISTS (
+                  SELECT 1 FROM merchant_wallets mw
+                  WHERE mw.merchant_id = m.id AND mw.network_type = 'evm'
+              )
+            "#
+        )
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("Failed to query merchants missing EVM wallets: {e}"))?;
+
+        for record in uninitialized_merchants {
+            let decrypted_mnemonic_bytes = decrypt_data(master_key, &record.encrypted_secret, &record.encryption_nonce)
+                .map_err(|e| format!("Failed to decrypt mnemonic for merchant {}: {e}", record.id))?;
+
+            let mnemonic_phrase = String::from_utf8(decrypted_mnemonic_bytes)
+                .map_err(|e| format!("Invalid UTF-8 mnemonic for merchant {}: {e}", record.id))?;
+
+            // Derive index 0 for the merchant wallet
+            let evm_address = derive_evm_address(&mnemonic_phrase, 0)
+                .map_err(|e| format!("Failed to derive EVM wallet for merchant {}: {e}", record.id))?;
+
+            sqlx::query!(
+                r#"
+                INSERT INTO merchant_wallets (merchant_id, network_type, address)
+                VALUES ($1, 'evm', $2)
+                ON CONFLICT (merchant_id, network_type) DO NOTHING
+                "#,
+                record.id,
+                evm_address.to_lowercase()
+            )
+                .execute(pool)
+                .await
+                .map_err(|e| format!("Failed to save derived EVM wallet for merchant {}: {e}", record.id))?;
+
+            println!("Initialized EVM wallet ({}) for merchant {}", evm_address, record.id);
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -2190,33 +2249,21 @@ impl NetworkClient for EVMNetwork {
 
     // --- BATCHED WATCHING METHODS ---
 
-    fn register_payment(&self, watch: PaymentWatch) {
-        if let Ok(mut pending) = self.pending.lock() {
-            println!("EVMNetwork::register_payment for invoice: {}", watch.invoice_id);
-            pending.insert(watch.invoice_id, watch);
-        }
-    }
-
-    fn unregister_payment(&self, invoice_id: Uuid) {
-        if let Ok(mut pending) = self.pending.lock() {
-            println!("EVMNetwork::unregister_payment for invoice: {}", invoice_id);
-            pending.remove(&invoice_id);
-        }
-    }
-
-    async fn watch_payments(&self, pool: &PgPool) -> Result<(), String> {
+    async fn spin_up(&self, pool: &PgPool) -> Result<(), String> {
         println!(
-            "EVMNetwork::watch_payments spinning up sub-services for {} ({})",
+            "EVMNetwork::spin_up initializing for {} ({})",
             self.network_name, self.chain_id
         );
 
-        // Run both services concurrently on the current instance
+        // 1. Backfill missing EVM addresses for all merchants at index 0
+        self.ensure_merchant_wallets(pool).await?;
+
+        // 2. Start watcher sub-services concurrently
         let (addresses_res, logs_res) = tokio::join!(
             self.watch_addresses(pool),
             self.watch_logs(pool)
         );
 
-        // Bubble up error if either service fails
         addresses_res?;
         logs_res?;
 

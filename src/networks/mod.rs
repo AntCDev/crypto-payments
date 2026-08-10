@@ -122,7 +122,7 @@ impl NetworkRegistry {
                 // Spawn background payment watcher task
                 let pool_clone = pool.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = network.watch_payments(&pool_clone).await {
+                    if let Err(err) = network.spin_up(&pool_clone).await {
                         eprintln!("❌ Error in EVM network (Chain ID: {}) watch_payments: {}", chain_id, err);
                     }
                 });
@@ -145,7 +145,7 @@ impl NetworkRegistry {
                 // Spawn background payment watcher task
                 let pool_clone = pool.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = network.watch_payments(&pool_clone).await {
+                    if let Err(err) = network.spin_up(&pool_clone).await {
                         eprintln!("❌ Error in Solana network ({:?}) watch_payments: {}", cluster, err);
                     }
                 });
@@ -168,7 +168,7 @@ impl NetworkRegistry {
                 // Spawn background payment watcher task
                 let pool_clone = pool.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = network.watch_payments(&pool_clone).await {
+                    if let Err(err) = network.spin_up(&pool_clone).await {
                         eprintln!("❌ Error in Bitcoin network ({:?}) watch_payments: {}", network_type, err);
                     }
                 });
@@ -207,14 +207,18 @@ pub struct Amount(pub u128);
 
 #[async_trait]
 pub trait NetworkClient: Send + Sync {
-    async fn get_derive_address(&self, pool: &PgPool, merchant_id: Uuid, invoice_id: Uuid, mnemonic: &str) -> Result<(String, u32, Option<String>), String>;
+    async fn get_derive_address(
+        &self,
+        pool: &PgPool,
+        merchant_id: Uuid,
+        invoice_id: Uuid,
+        mnemonic: &str,
+    ) -> Result<(String, u32, Option<String>), String>;
     fn validate_address(&self, address: &str) -> bool;
     async fn get_native_balance(&self, address: &str) -> Result<Amount, String>;
     async fn get_token_balance(&self, token_address: &str, address: &str, decimals: u8) -> Result<Amount, String>;
     async fn get_current_block(&self) -> Result<u64, String>;
-    fn register_payment(&self, watch: PaymentWatch);
-    fn unregister_payment(&self, invoice_id: Uuid);
-    async fn watch_payments(&self, pool: &PgPool) -> Result<(), String>;
+    async fn spin_up(&self, pool: &PgPool) -> Result<(), String>;
 }
 
 

@@ -1,4 +1,4 @@
-use super::{enqueue_webhook, Amount, NetworkClient, PaymentWatch, SolanaCluster};
+use super::{decrypt_data, enqueue_webhook, Amount, NetworkClient, PaymentWatch, SolanaCluster};
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -2075,6 +2075,69 @@ impl SolanaNetwork {
         let slot = self.get_slot(FINALIZED_COMMITMENT).await?;
         u64::try_from(slot).map_err(|_| "getSlot returned negative".to_string())
     }
+
+    async fn ensure_merchant_wallets(&self, pool: &PgPool) -> Result<(), String> {
+        let master_key_hex = std::env::var("MASTER_KEY")
+            .map_err(|_| "MASTER_KEY environment variable not set".to_string())?;
+
+        let master_key_vec = hex::decode(&master_key_hex)
+            .map_err(|_| "MASTER_KEY must be a valid hex string".to_string())?;
+
+        let master_key: &[u8; 32] = master_key_vec
+            .as_slice()
+            .try_into()
+            .map_err(|_| "MASTER_KEY must be exactly 32 bytes".to_string())?;
+
+        let network_type_key = NETWORK_TYPE.to_lowercase();
+
+        // Find merchants missing a Solana wallet record
+        let uninitialized_merchants = sqlx::query!(
+            r#"
+            SELECT m.id, km.encrypted_secret, km.encryption_nonce
+            FROM merchants m
+            JOIN merchant_key_material km ON m.id = km.merchant_id
+            WHERE km.key_family = 'bip39'
+              AND NOT EXISTS (
+                  SELECT 1 FROM merchant_wallets mw
+                  WHERE mw.merchant_id = m.id AND LOWER(mw.network_type) = $1
+              )
+            "#,
+            network_type_key
+        )
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("Failed to query merchants missing SOL wallets: {e}"))?;
+
+        for record in uninitialized_merchants {
+            let decrypted_mnemonic_bytes = decrypt_data(master_key, &record.encrypted_secret, &record.encryption_nonce)
+                .map_err(|e| format!("Failed to decrypt mnemonic for merchant {}: {e}", record.id))?;
+
+            let mnemonic_phrase = String::from_utf8(decrypted_mnemonic_bytes)
+                .map_err(|e| format!("Invalid UTF-8 mnemonic for merchant {}: {e}", record.id))?;
+
+            // Derive Solana address at index 0
+            let sol_address = derive_solana_address(&mnemonic_phrase, 0)
+                .map_err(|e| format!("Failed to derive Solana wallet for merchant {}: {e}", record.id))?;
+
+            sqlx::query!(
+                r#"
+                INSERT INTO merchant_wallets (merchant_id, network_type, address)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (merchant_id, network_type) DO NOTHING
+                "#,
+                record.id,
+                network_type_key,
+                sol_address
+            )
+                .execute(pool)
+                .await
+                .map_err(|e| format!("Failed to save derived SOL wallet for merchant {}: {e}", record.id))?;
+
+            println!("Initialized SOL wallet ({}) for merchant {}", sol_address, record.id);
+        }
+
+        Ok(())
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2359,17 +2422,18 @@ impl NetworkClient for SolanaNetwork {
         u64::try_from(slot).map_err(|_| "getSlot returned negative".to_string())
     }
 
+    async fn spin_up(&self, pool: &PgPool) -> Result<(), String> {
+        println!(
+            "SolanaNetwork::spin_up initializing for {} ({}/{})",
+            self.network_name,
+            NETWORK_TYPE,
+            self.chain_ref()
+        );
 
+        // 1. Backfill missing Solana addresses for all merchants at index 0
+        self.ensure_merchant_wallets(pool).await?;
 
-    fn register_payment(&self, watch: PaymentWatch) {
-        todo!()
-    }
-
-    fn unregister_payment(&self, invoice_id: Uuid) {
-        todo!()
-    }
-
-    async fn watch_payments(&self, pool: &PgPool) -> Result<(), String> {
-        todo!()
+        // 2. Run Solana address watcher service
+        self.watch_addresses(pool).await
     }
 }
