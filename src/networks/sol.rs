@@ -2344,13 +2344,13 @@ impl NetworkClient for SolanaNetwork {
         // signature is ever free to change, passing them in as arguments removes
         // both the round trip and the ordering constraint.
         let invoice = sqlx::query!(
-			r#"
-			SELECT token_address, token_program
-			FROM invoices
-			WHERE id = $1
-			"#,
-			invoice_id
-		)
+        r#"
+        SELECT token_address, token_program
+        FROM invoices
+        WHERE id = $1
+        "#,
+        invoice_id
+    )
             .fetch_one(pool)
             .await
             .map_err(|e| format!("Failed to load invoice {invoice_id} for derivation: {e}"))?;
@@ -2363,29 +2363,30 @@ impl NetworkClient for SolanaNetwork {
         if mint.is_some() && token_program.is_none() {
             return Err(format!(
                 "invoice {invoice_id}: token_address is set but token_program is NULL; \
-				 refusing to guess the token program"
+             refusing to guess the token program"
             ));
         }
 
         let row = sqlx::query!(
-			r#"
-			INSERT INTO merchant_network_indices (merchant_id, network, account_index, next_index)
-			VALUES ($1, $2, 0, 1)
-			ON CONFLICT (merchant_id, network, account_index)
-			DO UPDATE SET
-				next_index = merchant_network_indices.next_index + 1,
-				updated_at = CURRENT_TIMESTAMP
-			RETURNING next_index
-			"#,
-			merchant_id,
-			NETWORK_TYPE
-		)
+        r#"
+        INSERT INTO merchant_network_indices (merchant_id, network, account_index, next_index)
+        VALUES ($1, $2, 0, 1)
+        ON CONFLICT (merchant_id, network, account_index)
+        DO UPDATE SET
+            next_index = merchant_network_indices.next_index + 1,
+            updated_at = CURRENT_TIMESTAMP
+        RETURNING next_index
+        "#,
+        merchant_id,
+        NETWORK_TYPE
+    )
             .fetch_one(pool)
             .await
             .map_err(|e| format!("Failed to update merchant network index: {e}"))?;
 
-        let index = u32::try_from(row.next_index - 1)
-            .map_err(|_| format!("Invalid wallet index: {}", row.next_index - 1))?;
+        // Directly use row.next_index so the sequence starts at 1
+        let index = u32::try_from(row.next_index)
+            .map_err(|_| format!("Invalid wallet index: {}", row.next_index))?;
 
         // The HD-derived owner pubkey. This is simultaneously:
         //   - the deposit address, when the invoice is for native SOL
