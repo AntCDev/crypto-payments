@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS payments (
                                         tx_hash        VARCHAR(255) NOT NULL,
                                         amount         NUMERIC(78, 0) NOT NULL,
                                         block_number   BIGINT NOT NULL,
-                                        block_hash     VARCHAR(255) NOT NULL,
+                                        block_hash     VARCHAR(255),
                                         confirmations  INT NOT NULL DEFAULT 0,
                                         status         VARCHAR(50) NOT NULL DEFAULT 'detected'
                                             CHECK (status IN ('detected', 'merchant_confirmed', 'system_confirmed', 'orphaned')),

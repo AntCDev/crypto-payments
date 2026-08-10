@@ -128,13 +128,13 @@ impl TokenHandler for DevnetHandler {
             .map_err(|_| "MASTER_KEY must be exactly 32 bytes (64 hex characters)".to_string())?;
 
         let key_material = sqlx::query!(
-        r#"
-        SELECT encrypted_secret, encryption_nonce
-        FROM merchant_key_material
-        WHERE merchant_id = $1 AND key_family = 'bip39'
-        "#,
-        merchant_id
-    )
+			r#"
+			SELECT encrypted_secret, encryption_nonce
+			FROM merchant_key_material
+			WHERE merchant_id = $1 AND key_family = 'bip39'
+			"#,
+			merchant_id
+		)
             .fetch_one(pool)
             .await
             .map_err(|e| format!("Failed to fetch key material for merchant {merchant_id}: {e}"))?;
@@ -166,7 +166,7 @@ impl TokenHandler for DevnetHandler {
                 _ => {
                     return Err(format!(
                         "token {} has a mint configured but no token_program; refusing to create \
-                         invoice {invoice_id} with an unguessable ATA",
+						 invoice {invoice_id} with an unguessable ATA",
                         self.config.id
                     ))
                 }
@@ -176,40 +176,44 @@ impl TokenHandler for DevnetHandler {
         // The reference path is dead without this row, so surface it at creation
         // time instead of letting the watcher log about it once per tick forever.
         let merchant_wallet = sqlx::query_scalar!(
-        r#"
-        SELECT address FROM merchant_wallets
-        WHERE merchant_id = $1 AND network_type = 'solana'
-        "#,
-        merchant_id
-    )
+			r#"
+			SELECT address FROM merchant_wallets
+			WHERE merchant_id = $1 AND network_type = 'solana'
+			"#,
+			merchant_id
+		)
             .fetch_optional(pool)
             .await
             .map_err(|e| format!("Failed to look up merchant wallet: {e}"))?;
 
         if merchant_wallet.is_none() {
             eprintln!(
-                "merchant {merchant_id} has no merchant_wallets row for 'sol'; invoice \
-             {invoice_id} will only be payable via the direct/QR path"
+                "merchant {merchant_id} has no merchant_wallets row for 'solana'; invoice \
+				 {invoice_id} will only be payable via the direct/QR path"
             );
         }
 
         // Written before derivation: get_derive_address reads these two columns back
         // off the row to decide which program the ATA is derived under. The invoice
-        // is not yet visible to the watcher — its wallet_address is still NULL/'' —
-        // so a crash between this statement and the one below leaves a row that is
-        // never polled and simply expires.
+        // is not yet visible to the watcher — its wallet_address is still '' — so a
+        // crash between this statement and the one below leaves a row that is never
+        // polled and simply expires.
+        //
+        // Bound by reference (`as_deref`) rather than by value: both values are read
+        // again when PaymentDetails is built, and the macro takes ownership of what
+        // it is handed.
         sqlx::query!(
-        r#"
-        UPDATE invoices
-        SET token_address = $1,
-            token_program = $2,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = $3
-        "#,
-        token_address,
-        token_program,
-        invoice_id
-    )
+			r#"
+			UPDATE invoices
+			SET token_address = $1,
+				token_program = $2,
+				updated_at = CURRENT_TIMESTAMP
+			WHERE id = $3
+			"#,
+			token_address.as_deref(),
+			token_program.as_deref(),
+			invoice_id
+		)
             .execute(pool)
             .await
             .map_err(|e| format!("Failed to set token fields on invoice {invoice_id}: {e}"))?;
@@ -220,6 +224,7 @@ impl TokenHandler for DevnetHandler {
             .await
             .map_err(|e| format!("Address derivation failed: {e}"))?;
 
+        // TODO: merchant-configurable rather than a fixed half hour.
         let expires_at = Utc::now() + Duration::minutes(30);
 
         // Deliberately the FINALIZED slot, not the processed/confirmed tip.
@@ -233,37 +238,39 @@ impl TokenHandler for DevnetHandler {
             .await
             .map_err(|e| format!("Failed to fetch finalized slot: {e}"))? as i64;
 
+        // Must match the watcher's constant exactly, and must be the same string
+        // merchant_wallets and merchant_network_indices use.
         let network_type = "solana";
-        let chain_ref = self.network.chain_ref(); // was hardcoded "devnet"
+        let chain_ref = self.network.chain_ref();
 
         // token_address / token_program are already committed above; setting
         // wallet_address here is what makes the invoice visible to the watcher.
         sqlx::query!(
-        r#"
-        UPDATE invoices
-        SET wallet_address = $1,
-            wallet_index = $2,
-            expires_at = $3,
-            payment_reference = $4,
-            token_decimals = $5,
-            required_confirmations = $6,
-            network_type = $7,
-            chain_ref = $8,
-            created_block = $9,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = $10
-        "#,
-        deposit_address,
-        derived_wallet_index as i32,
-        expires_at,
-        payment_reference,
-        self.config.decimals as i16,
-        self.config.required_confirmations as i16,
-        network_type,
-        chain_ref,
-        current_slot,
-        invoice_id
-    )
+			r#"
+			UPDATE invoices
+			SET wallet_address = $1,
+				wallet_index = $2,
+				expires_at = $3,
+				payment_reference = $4,
+				token_decimals = $5,
+				required_confirmations = $6,
+				network_type = $7,
+				chain_ref = $8,
+				created_block = $9,
+				updated_at = CURRENT_TIMESTAMP
+			WHERE id = $10
+			"#,
+			deposit_address.as_str(),
+			derived_wallet_index as i32,
+			expires_at,
+			payment_reference.as_deref(),
+			self.config.decimals as i16,
+			self.config.required_confirmations as i16,
+			network_type,
+			chain_ref.as_str(),
+			current_slot,
+			invoice_id
+		)
             .execute(pool)
             .await
             .map_err(|e| format!("DB update failed: {e}"))?;
