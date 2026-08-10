@@ -141,7 +141,7 @@ impl TokenHandler for BaseSepoliaHandler {
         // 4. Derive wallet address and payment reference using decrypted mnemonic
         let (deposit_address, derived_wallet_index, payment_reference) = self
             .network
-            .get_derive_address(pool, merchant_id, invoice_id, &merchant_mnemonic, None)
+            .get_derive_address(pool, merchant_id, invoice_id, &merchant_mnemonic)
             .await
             .map_err(|e| format!("Address derivation failed: {e}"))?;
 

@@ -185,7 +185,6 @@ impl NetworkClient for EsploraNetwork {
         merchant_id: Uuid,
         invoice_id: Uuid,
         mnemonic: &str,
-        token_address: Option<&str>
     ) -> Result<(String, u32, Option<String>), String> {
         // Automatically tracks and increments the merchant's key index for account 0
         let row = sqlx::query!(

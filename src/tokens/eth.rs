@@ -52,7 +52,7 @@ impl TokenHandler for EthHandler {
 
         // Dynamic key derivation using the shared EVM network helper
         let (deposit_address, derived_wallet_index, payment_reference) = self.network
-            .get_derive_address(pool, merchant_id, invoice_id, merchant_mnemonic, None)
+            .get_derive_address(pool, merchant_id, invoice_id, merchant_mnemonic)
             .await
             .map_err(|e| format!("Address derivation failed: {e}"))?;
 

@@ -57,10 +57,10 @@ struct SolTokenAccountsValue {
 
 type HmacSha512 = Hmac<Sha512>;
 const SOLANA_HARDENED_OFFSET: u32 = 0x8000_0000;
-const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const PDA_MARKER: &[u8] = b"ProgramDerivedAddress";
-
+pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+pub const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+pub const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 
 
 // ---------- derivation path ----------
@@ -189,10 +189,14 @@ fn find_program_address(seeds: &[&[u8]], program_id: &[u8; 32]) -> Result<([u8; 
 }
 
 /// Derives the Associated Token Account address for `owner_address` + `mint_address`.
-fn derive_associated_token_address(owner_address: &str, mint_address: &str) -> Result<String, String> {
+fn derive_associated_token_address(
+    owner_address: &str,
+    mint_address: &str,
+    token_program_id: &str,
+) -> Result<String, String> {
     let owner_bytes = decode_pubkey(owner_address)?;
     let mint_bytes = decode_pubkey(mint_address)?;
-    let token_program_bytes = decode_pubkey(TOKEN_PROGRAM_ID)?;
+    let token_program_bytes = decode_pubkey(token_program_id)?;
     let associated_token_program_bytes = decode_pubkey(ASSOCIATED_TOKEN_PROGRAM_ID)?;
 
     let seeds: [&[u8]; 3] = [&owner_bytes, &token_program_bytes, &mint_bytes];
@@ -228,42 +232,46 @@ fn parse_derivation_path(path: &str) -> Result<Vec<u32>, String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tunables. All of these become per-merchant / per-cluster config later.
+// Tunables
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// What `invoices.network_type` is written as by the creation path.
 const NETWORK_TYPE: &str = "solana";
 
-/// ~400ms slots, but RPC providers rate-limit harder than they block. 2s is a
-/// good compromise: a `confirmed` transaction is visible within one tick.
+/// What `merchant_wallets.network_type` is written as. These are NOT the same
+/// string and conflating them silently disables the reference path, because the
+/// LEFT JOIN just yields NULL and every invoice ends up with an empty
+/// merchant_target. Keeping them as two named constants makes that impossible
+/// to reintroduce by accident.
+const MERCHANT_WALLET_NETWORK: &str = "solana";
+
 const POLL_INTERVAL_SECS: u64 = 2;
-
-/// `getSignaturesForAddress` hard cap is 1000.
 const SIG_PAGE_LIMIT: usize = 1000;
-
-/// Catch-up throttle per address per tick. A fresh invoice with an old
-/// `created_slot` can't pin the loop for an unbounded number of pages.
 const MAX_SIG_PAGES_PER_ADDRESS: usize = 5;
-
-/// JSON-RPC batch size for `getTransaction`. Providers vary; 50 is safe.
 const MAX_TX_PER_BATCH: usize = 50;
-
-/// `getSignatureStatuses` hard cap is 256 signatures per call.
 const MAX_STATUS_PER_BATCH: usize = 256;
-
-/// How many addresses we poll concurrently.
 const ADDRESS_CONCURRENCY: usize = 8;
 
-/// Canonical confirmation numbers written back to `payments.confirmations`.
-/// These exist so the rest of the stack (API, webhooks, merchant dashboard)
-/// keeps speaking the same language as the EVM path. They are labels, not
-/// counts — nothing on Solana derives meaning from the arithmetic.
+/// Hard ceiling on how many invoices one tick will watch. Two addresses per
+/// invoice at worst, so this is the real bound on RPC calls per tick.
+const MAX_WATCHED_INVOICES: i64 = 5_000;
+
+/// Slack on the `created_block` floor. `get_current_block()` at invoice creation
+/// can read a slot the payer's transaction then lands *behind* (processed vs
+/// confirmed skew, or a node slightly ahead of the one the wallet used). Without
+/// margin those payments are thrown away as "older than the invoice".
+const CREATED_SLOT_MARGIN: i64 = 64;
+
+/// Signatures newer than this many slots are still in the node's recent-status
+/// cache, so `searchTransactionHistory` is unnecessary (and expensive) for them.
+const RECENT_STATUS_WINDOW_SLOTS: i64 = 300;
+
 const CONF_DETECTED: i64 = 1;
 const CONF_CONFIRMED: i64 = 16;
 const CONF_FINALIZED: i64 = 32;
 
-/// Commitment used for detection. `confirmed` = supermajority voted, ~1 slot.
 const DETECT_COMMITMENT: &str = "confirmed";
-
+const FINALIZED_COMMITMENT: &str = "finalized";
 // ─────────────────────────────────────────────────────────────────────────────
 // Confirmation levels
 // ─────────────────────────────────────────────────────────────────────────────
@@ -276,9 +284,6 @@ enum ConfirmLevel {
 }
 
 impl ConfirmLevel {
-    /// Clamp a merchant's numeric threshold onto the three buckets Solana
-    /// actually has. Anything <= 1 is "I ship on sight", 32+ is "I wait for
-    /// irreversibility", everything in between is the middle bucket.
     fn from_required(required: i64) -> Self {
         if required >= CONF_FINALIZED {
             Self::Finalized
@@ -323,47 +328,67 @@ impl ConfirmLevel {
 struct WatchedInvoice {
     invoice_id: Uuid,
     merchant_id: Uuid,
-    /// Direct path target. Native: HD-derived pubkey. SPL: its ATA for `mint`.
+    /// Naive-path target. Native: the HD-derived pubkey. SPL: that pubkey's ATA
+    /// for `mint`, which is what the payer's wallet will build on its side.
     deposit_address: String,
-    /// Reference path key: the HD-derived pubkey, attached read-only to the
-    /// transfer. Unique per invoice, which is what makes attribution possible
-    /// when one merchant has many invoices open at once.
+    /// Smart-path key: the HD-derived pubkey, attached read-only. For a native
+    /// invoice this is byte-identical to `deposit_address`; that is intentional
+    /// and every place it matters is handled explicitly below.
     payment_reference: String,
-    /// Reference path credit target: merchant main wallet (native) or the
-    /// merchant's ATA for `mint` (SPL).
+    /// Smart-path credit target: merchant main wallet (native) or that wallet's
+    /// ATA for `mint` (SPL). Empty => reference path disabled for this invoice.
     merchant_target: String,
-    /// Base units. Lamports for native, token atoms for SPL. Never human-readable.
     amount_requested: Decimal,
     /// None => native SOL.
     mint: Option<String>,
+    token_program: Option<String>,
     level: ConfirmLevel,
     created_slot: Option<i64>,
 }
 
 impl WatchedInvoice {
-    /// Every address whose signature feed can carry money for this invoice.
-    /// The merchant target is deliberately NOT in here — it's shared across
-    /// every invoice for that merchant and gets hit by unrelated traffic. We
-    /// reach it through the reference instead, which is 1:1 with the invoice.
-    fn watch_addresses(&self) -> [&str; 2] {
-        [&self.deposit_address, &self.payment_reference]
+    /// Address feeds that can carry money for this invoice, deduped.
+    ///
+    /// Native invoices collapse to a single address, so we don't poll the same
+    /// feed twice and don't double-list it in the prune whitelist.
+    fn watch_addresses(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = Vec::with_capacity(2);
+        if !self.deposit_address.is_empty() {
+            v.push(&self.deposit_address);
+        }
+        if !self.payment_reference.is_empty() && self.payment_reference != self.deposit_address {
+            v.push(&self.payment_reference);
+        }
+        v
+    }
+
+    /// A transaction older than the invoice cannot be paying it. Margin absorbs
+    /// slot skew between whatever node stamped `created_block` and whatever node
+    /// the payer's wallet submitted through.
+    fn slot_is_plausible(&self, slot: i64) -> bool {
+        match self.created_slot {
+            Some(c) => slot >= c - CREATED_SLOT_MARGIN,
+            None => true,
+        }
     }
 }
 
-/// What a fetched transaction did, reduced to just the balance movements.
+/// A fetched transaction reduced to balance movements.
 ///
-/// Deltas rather than parsed instructions on purpose: a payer can move SPL
-/// tokens with `transfer`, `transferChecked`, a CPI from some aggregator, or
-/// several instructions in one transaction. Pre/post balances are the ground
-/// truth for all of them and can't be spoofed by instruction shape.
+/// Deltas rather than parsed instructions: a payer can move tokens with
+/// `transfer`, `transferChecked`, a CPI from an aggregator, or several
+/// instructions at once. Pre/post balances cover all of them and can't be
+/// spoofed by instruction shape.
 struct TxView {
     signature: String,
     slot: i64,
     failed: bool,
     account_keys: HashSet<String>,
-    /// address -> lamport delta
+    /// Keys that signed. A Solana Pay `reference` is always read-only and
+    /// non-signing, so this is what separates "a payer referenced our HD key"
+    /// from "we swept our own HD key into the merchant wallet".
+    signers: HashSet<String>,
     native_delta: HashMap<String, i128>,
-    /// (token account address, mint) -> atom delta
     token_delta: HashMap<(String, String), i128>,
 }
 
@@ -379,7 +404,6 @@ impl TxView {
             .unwrap_or(0)
     }
 
-    /// Credit landing on `address` for this invoice's asset.
     fn credit(&self, address: &str, mint: Option<&str>) -> i128 {
         match mint {
             None => self.native_credit(address),
@@ -388,13 +412,10 @@ impl TxView {
     }
 }
 
-/// A signature we found on an address feed, before we've fetched the body.
 #[derive(Clone)]
 struct SigRef {
     signature: String,
     slot: i64,
-    /// `err` from the signature listing — lets us drop failures without
-    /// spending a `getTransaction` on them.
     failed: bool,
 }
 
@@ -407,7 +428,6 @@ pub struct SolanaNetwork {
     rpc_urls: Vec<String>,
     pub network_name: String,
     client: reqwest::Client,
-    pending: Mutex<HashMap<Uuid, PaymentWatch>>,
 }
 
 impl SolanaNetwork {
@@ -420,24 +440,17 @@ impl SolanaNetwork {
             rpc_urls,
             network_name,
             client: reqwest::Client::new(),
-            pending: Mutex::new(HashMap::new()),
         }
     }
 
-    fn chain_ref(&self) -> String {
+    /// Single source of truth for `chain_ref`. The invoice creation path must
+    /// call this too rather than hardcoding "devnet", or invoices land with a
+    /// chain_ref the watcher's WHERE clause never matches.
+    pub fn chain_ref(&self) -> String {
         format!("{:?}", self.cluster).to_lowercase()
     }
 
     // ── RPC ──────────────────────────────────────────────────────────────────
-    //
-    // Note on quorum: the EVM code cross-checks providers because a bad block
-    // read silently credits or drops money. On Solana the equivalent guarantee
-    // comes from commitment, not from polling several nodes — two honest nodes
-    // legitimately disagree about the last ~32 slots, so quorum on
-    // `getSignaturesForAddress` would fail constantly at the tip while adding
-    // nothing at `finalized`. So: failover for reads, and let finality be the
-    // arbiter. `reconcile_statuses` is what actually decides whether money is
-    // real, and it only ever promotes to `system_confirmed` on `finalized`.
 
     async fn rpc(&self, method: &'static str, params: Value) -> Result<Value, String> {
         let mut last_err = String::new();
@@ -450,9 +463,6 @@ impl SolanaNetwork {
         Err(format!("[{}] all endpoints failed for {method}: {last_err}", self.network_name))
     }
 
-    /// JSON-RPC 2.0 batch. Results come back keyed by `id`, in arbitrary order,
-    /// so we reindex before returning. One HTTP round trip for up to
-    /// `MAX_TX_PER_BATCH` transactions instead of N.
     async fn rpc_batch(
         &self,
         calls: &[(&'static str, Value)],
@@ -488,8 +498,6 @@ impl SolanaNetwork {
             };
 
             let Some(entries) = body.as_array() else {
-                // Some providers return a single error object instead of an
-                // array when the whole batch is rejected (size limits, auth).
                 last_err = format!("Non-array batch response from {url}: {body}");
                 continue;
             };
@@ -556,15 +564,14 @@ impl SolanaNetwork {
 
     pub async fn watch_addresses(&self, pool: &PgPool) -> Result<(), String> {
         println!(
-            "SolanaNetwork::watch_addresses service started for {}",
-            self.network_name
+            "SolanaNetwork::watch_addresses service started for {} ({}/{})",
+            self.network_name,
+            NETWORK_TYPE,
+            self.chain_ref()
         );
 
         loop {
             if let Err(e) = self.tick(pool).await {
-                // Transient by assumption: RPC hiccup, provider lagging, rate
-                // limit. Cursors only advance on success, so the next tick
-                // simply redoes the work.
                 eprintln!(
                     "SolanaNetwork::watch_addresses tick failed [{}]: {e}",
                     self.network_name
@@ -575,37 +582,32 @@ impl SolanaNetwork {
     }
 
     async fn tick(&self, pool: &PgPool) -> Result<(), String> {
+        // Expiry first: an invoice whose timer ran out this tick shouldn't get
+        // one more round of polling before it drops out of `watched`.
+        self.expire_invoices(pool).await?;
+
         let watched = self.load_watched_invoices(pool).await?;
 
-        // Finalized slot is the watermark the persisted cursors are allowed to
-        // reach. Everything above it is rescan territory every tick.
-        let finalized_slot = self.get_slot("finalized").await?;
-
         if watched.is_empty() {
-            // Nothing to do. Don't touch cursors — an address with no live
-            // invoice and no in-flight payment is garbage-collected below, and
-            // the rest keep their position for when their invoice comes back.
-            self.prune_address_cursors(pool, &watched).await?;
+            // Nothing live. Deliberately do NOT prune here — with an empty
+            // whitelist the `<> ALL` predicate matches every row and would wipe
+            // the cursor table the moment the merchant has a quiet minute.
             return Ok(());
         }
 
-        // ── 1. Address -> invoices index ─────────────────────────────────────
-        // One address can map to several invoices only in pathological cases
-        // (a merchant reusing a deposit address across invoices, which the
-        // creation path should prevent). The Vec keeps it correct anyway.
-        let mut by_address: HashMap<String, Vec<WatchedInvoice>> = HashMap::new();
+        let finalized_slot = self.get_slot("finalized").await?;
+        let invoice_ids: Vec<Uuid> = watched.iter().map(|w| w.invoice_id).collect();
+
+        // ── 1. Address set ───────────────────────────────────────────────────
+        let mut addresses: HashSet<String> = HashSet::new();
         for w in &watched {
             for addr in w.watch_addresses() {
-                if addr.is_empty() {
-                    continue;
-                }
-                by_address.entry(addr.to_string()).or_default().push(w.clone());
+                addresses.insert(addr.to_string());
             }
         }
+        let addresses: Vec<String> = addresses.into_iter().collect();
 
-        let addresses: Vec<String> = by_address.keys().cloned().collect();
-
-        // ── 2. Discover new signatures, concurrently, one cursor per address ──
+        // ── 2. Discover new signatures, one cursor per address ───────────────
         let discovered: Vec<(String, Result<Vec<SigRef>, String>)> = stream::iter(addresses)
             .map(|addr| async move {
                 let res = self.discover_signatures(pool, &addr).await;
@@ -615,10 +617,6 @@ impl SolanaNetwork {
             .collect()
             .await;
 
-        // Dedupe: the same transaction shows up on two feeds whenever a payer
-        // hits the deposit address and the reference in one go, and the same
-        // signature can legitimately serve two invoices. Fetch once, apply once
-        // per (invoice, path).
         let mut sig_slots: HashMap<String, SigRef> = HashMap::new();
         let mut per_address: HashMap<String, Vec<SigRef>> = HashMap::new();
 
@@ -631,22 +629,46 @@ impl SolanaNetwork {
                     per_address.insert(addr, sigs);
                 }
                 Err(e) => {
-                    // Partial failure is fine: this address just doesn't advance
-                    // its cursor this tick and retries on the next one.
                     eprintln!("[{}] signature scan failed for {addr}: {e}", self.network_name);
                 }
             }
         }
 
-        // ── 3. Fetch bodies in batches, oldest first ─────────────────────────
+        // ── 3. Skip anything already booked ──────────────────────────────────
+        //
+        // The unfinalized window (~32 slots) is re-listed every tick by design.
+        // Without this filter that means re-fetching and re-parsing the same
+        // transaction bodies every 2 seconds forever, which is most of the RPC
+        // bill. Safe to skip because `apply_transaction` is now all-or-nothing
+        // across every invoice a transaction touches: if the signature is on
+        // record and not orphaned, every credit it produced is on record too.
+        let already: HashSet<String> = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT DISTINCT tx_hash
+              FROM payments
+             WHERE invoice_id = ANY($1)
+               AND status <> 'orphaned'
+            "#,
+        )
+            .bind(&invoice_ids)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("load applied signatures: {e}"))?
+            .into_iter()
+            .collect();
+
         let mut to_fetch: Vec<SigRef> = sig_slots
             .into_values()
-            .filter(|s| !s.failed) // failed txs moved no money; nothing to credit
+            .filter(|s| !s.failed && !already.contains(&s.signature))
             .collect();
         to_fetch.sort_by_key(|s| s.slot);
 
-        let mut applied: HashSet<String> = HashSet::new();
+        // Seed with `already` so the cursor logic below treats known signatures
+        // as satisfied rather than as holes it must stop at.
+        let mut applied: HashSet<String> = already;
+        let mut touched: HashSet<Uuid> = HashSet::new();
 
+        // ── 4. Fetch bodies in batches, oldest first ─────────────────────────
         for chunk in to_fetch.chunks(MAX_TX_PER_BATCH) {
             let calls: Vec<(&'static str, Value)> = chunk
                 .iter()
@@ -669,12 +691,9 @@ impl SolanaNetwork {
 
             for (sig_ref, result) in chunk.iter().zip(results) {
                 let raw = match result {
-                    Ok(Value::Null) => {
-                        // Listed by the index but not yet servable at this
-                        // commitment on the node we hit. Leave it; the cursor
-                        // won't advance past it and we'll get it next tick.
-                        continue;
-                    }
+                    // Listed by the index but not servable at this commitment on
+                    // the node we hit. The cursor won't pass it; next tick.
+                    Ok(Value::Null) => continue,
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!(
@@ -701,27 +720,30 @@ impl SolanaNetwork {
                     continue;
                 }
 
-                self.apply_transaction(pool, &tx, &watched).await?;
+                let hit = self.apply_transaction(pool, &tx, &watched).await?;
+                touched.extend(hit);
                 applied.insert(tx.signature.clone());
             }
         }
 
-        // ── 4. Advance cursors, but only up to the finalized watermark ───────
+        // ── 5. Recompute each affected invoice exactly once ──────────────────
+        for invoice_id in &touched {
+            self.recompute_invoice_totals(pool, *invoice_id, &watched).await?;
+        }
+
+        // ── 6. Advance cursors, capped at the finalized watermark ────────────
         //
-        // The persisted cursor is a *resume point*, not a "how far have I
-        // looked" marker. Parking it at the newest finalized signature means:
-        //   - a restart never resumes from a slot that can later fork away;
-        //   - the unfinalized window (~32 slots) is rescanned every tick, so a
-        //     transaction that gets re-landed on the winning fork is picked up
-        //     without any explicit reorg machinery;
-        //   - the rescan is a handful of signatures per address, so it's free.
+        // The cursor is a resume point, not a high-water mark. Parking it at the
+        // newest finalized signature means a restart never resumes from a slot
+        // that can still fork away, and the unfinalized window is re-listed each
+        // tick so a re-landed transaction is picked up with no reorg machinery.
         for (addr, sigs) in &per_address {
-            // Stop at the first signature we couldn't apply — never skip a hole.
             let mut best: Option<&SigRef> = None;
             for s in sigs {
                 if s.slot > finalized_slot {
                     break;
                 }
+                // Never step over a hole.
                 if !s.failed && !applied.contains(&s.signature) {
                     break;
                 }
@@ -732,13 +754,11 @@ impl SolanaNetwork {
             }
         }
 
-        // ── 5. Promote / orphan everything in flight ─────────────────────────
+        // ── 7. Promote / orphan everything in flight ─────────────────────────
         self.reconcile_statuses(pool, finalized_slot, &watched).await?;
 
-        // ── 6. Housekeeping ──────────────────────────────────────────────────
-        self.expire_invoices(pool).await?;
+        // ── 8. Housekeeping ──────────────────────────────────────────────────
         self.prune_address_cursors(pool, &watched).await?;
-        self.drop_settled_from_pending(pool, &watched).await?;
 
         Ok(())
     }
@@ -747,12 +767,18 @@ impl SolanaNetwork {
 
     /// Everything new on this address's feed, oldest first.
     ///
-    /// `getSignaturesForAddress` returns newest-first and stops early when it
-    /// hits `until`. We page backwards from the tip until we hit the cursor,
-    /// then reverse. Two independent stop conditions, because `until` alone is
-    /// not safe: if the cursor signature is ever unreachable (pruned history on
-    /// a non-archival node, or a fork that dropped it), `until` never matches
-    /// and we'd page back to genesis. The slot floor catches that.
+    /// `getSignaturesForAddress` is newest-first and stops at `until`. We page
+    /// backwards until the cursor, then reverse. Two stop conditions, because
+    /// `until` alone isn't safe: if the cursor signature becomes unreachable
+    /// (pruned history on a non-archival node, or a fork that dropped it),
+    /// `until` never matches and we'd page back toward genesis. The slot floor
+    /// catches that.
+    ///
+    /// The floor comparison is strictly `<`. It used to be `<=` when a cursor
+    /// existed, which silently discarded every signature sharing a slot with the
+    /// cursor but ordered after it — and Solana puts a lot of transactions in a
+    /// slot. Re-listing the cursor's own slot costs nothing (the tx_hash filter
+    /// in `tick` drops the ones already booked) and losing one costs a payment.
     async fn discover_signatures(
         &self,
         pool: &PgPool,
@@ -760,11 +786,10 @@ impl SolanaNetwork {
     ) -> Result<Vec<SigRef>, String> {
         let cursor = self.load_address_cursor(pool, address).await?;
 
-        // Cold start floors at the earliest `created_slot` of the invoices on
-        // this address — an invoice can't be paid before it existed, so
-        // anything older is somebody else's history.
         let floor_slot = match &cursor {
             Some((_, slot)) => *slot,
+            // Cold start: an invoice can't be paid before it existed, so
+            // anything older belongs to somebody else's history.
             None => self.cold_start_floor(pool, address).await?,
         };
         let until_sig = cursor.as_ref().map(|(s, _)| s.clone());
@@ -808,13 +833,14 @@ impl SolanaNetwork {
 
                 last_sig = Some(signature.clone());
 
-                if slot <= floor_slot && cursor.is_some() {
-                    // At or below the resume point. Anything here is either the
-                    // cursor itself or already applied.
+                if slot < floor_slot {
                     hit_floor = true;
                     break;
                 }
-                if slot < floor_slot {
+
+                // The resume point itself. Everything before it is applied;
+                // everything after it in the same slot still has to be read.
+                if until_sig.as_deref() == Some(signature.as_str()) {
                     hit_floor = true;
                     break;
                 }
@@ -836,16 +862,15 @@ impl SolanaNetwork {
         Ok(out)
     }
 
-    /// Earliest slot worth looking at for a cold address.
     async fn cold_start_floor(&self, pool: &PgPool, address: &str) -> Result<i64, String> {
         let floor = sqlx::query_scalar::<_, Option<i64>>(
             r#"
-    SELECT MIN(i.created_block)
-      FROM invoices i
-     WHERE i.network_type = $1
-       AND i.chain_ref = $2
-       AND (i.wallet_address = $3 OR i.payment_reference = $3)
-    "#,
+            SELECT MIN(i.created_block)
+              FROM invoices i
+             WHERE i.network_type = $1
+               AND i.chain_ref = $2
+               AND (i.wallet_address = $3 OR i.payment_reference = $3)
+            "#,
         )
             .bind(NETWORK_TYPE)
             .bind(self.chain_ref())
@@ -854,25 +879,39 @@ impl SolanaNetwork {
             .await
             .map_err(|e| format!("cold_start_floor: {e}"))?;
 
-
-        // No created_slot recorded (older rows) => take the whole feed, capped
-        // by MAX_SIG_PAGES_PER_ADDRESS.
-        Ok(floor.unwrap_or(0).max(0))
+        // Same margin as the per-invoice plausibility check, for the same
+        // reason. No created_block recorded (older rows) => take the whole feed,
+        // capped by MAX_SIG_PAGES_PER_ADDRESS.
+        Ok((floor.unwrap_or(0) - CREATED_SLOT_MARGIN).max(0))
     }
 
     // ── Attribution ──────────────────────────────────────────────────────────
 
     /// Which invoice does this transaction pay, and by which path?
     ///
-    /// Direct path first: a positive delta on the invoice's own deposit address
-    /// in the invoice's own asset is unambiguous — nobody else can be paid at
+    /// Direct (naive) path first: a positive delta on the invoice's own deposit
+    /// address in the invoice's own asset is unambiguous. Nobody else is paid at
     /// that address, and a native transfer can never satisfy a token invoice
-    /// (or vice versa) because we look at a different balance table entirely.
+    /// because we read a different balance table entirely.
     ///
-    /// Reference path second, and only when exactly one of our references is
-    /// present. Two references in one transaction would mean one credit to the
-    /// merchant wallet with two claimants and no way to split it; that's a
-    /// human problem, so we log loudly and credit nothing rather than guess.
+    /// Reference (smart) path second, and only under four conditions:
+    ///
+    ///   1. The reference key did NOT sign. A Solana Pay reference is a
+    ///      read-only non-signer by construction. This is the guard that stops
+    ///      the merchant's own sweep — HD address -> merchant wallet — from
+    ///      being re-credited as a payment. For a native invoice the reference
+    ///      IS the deposit address, so a sweep transaction contains our key and
+    ///      credits our merchant wallet, which looked exactly like a smart-path
+    ///      payment before this check existed. It also stops a third party from
+    ///      steering attribution by naming our HD key in a transaction of their
+    ///      own.
+    ///   2. The reference account's own lamports didn't go down. Belt and
+    ///      braces for the same class of outbound flow.
+    ///   3. The invoice wasn't already credited on the direct path in this same
+    ///      transaction.
+    ///   4. Exactly one of our references is present. Two would mean one
+    ///      merchant-wallet credit with two claimants and no way to split it —
+    ///      a human problem, so we log loudly and credit nothing.
     fn classify<'a>(
         &self,
         tx: &TxView,
@@ -882,19 +921,20 @@ impl SolanaNetwork {
 
         // ── direct ──
         for inv in watched {
-            if !tx.account_keys.contains(&inv.deposit_address) {
+            if inv.deposit_address.is_empty() || !tx.account_keys.contains(&inv.deposit_address) {
                 continue;
             }
-            if let Some(created) = inv.created_slot {
-                if tx.slot < created {
-                    continue;
-                }
+            if !inv.slot_is_plausible(tx.slot) {
+                continue;
             }
             let credit = tx.credit(&inv.deposit_address, inv.mint.as_deref());
             if credit > 0 {
                 match i128_to_decimal(credit) {
                     Ok(d) => out.push((inv, d, "direct")),
-                    Err(e) => eprintln!("[{}] amount overflow on {}: {e}", self.network_name, tx.signature),
+                    Err(e) => eprintln!(
+                        "[{}] amount overflow on {}: {e}",
+                        self.network_name, tx.signature
+                    ),
                 }
             }
         }
@@ -904,7 +944,10 @@ impl SolanaNetwork {
             .iter()
             .filter(|inv| {
                 !inv.payment_reference.is_empty()
+                    && !inv.merchant_target.is_empty()
                     && tx.account_keys.contains(&inv.payment_reference)
+                    && !tx.signers.contains(&inv.payment_reference)
+                    && tx.native_credit(&inv.payment_reference) >= 0
             })
             .collect();
 
@@ -920,63 +963,89 @@ impl SolanaNetwork {
             return out;
         }
 
-        if let Some(inv) = refs.first() {
-            if let Some(created) = inv.created_slot {
-                if tx.slot < created {
-                    return out;
-                }
-            }
-            // Already credited on the direct path in this same transaction?
-            // Can happen if the payer's wallet routes through the deposit
-            // address. Don't double count.
-            if out.iter().any(|(i, _, _)| i.invoice_id == inv.invoice_id) {
-                return out;
-            }
+        let Some(inv) = refs.first().copied() else { return out };
 
-            let credit = tx.credit(&inv.merchant_target, inv.mint.as_deref());
-            if credit > 0 {
-                match i128_to_decimal(credit) {
-                    Ok(d) => out.push((inv, d, "reference")),
-                    Err(e) => eprintln!("[{}] amount overflow on {}: {e}", self.network_name, tx.signature),
-                }
-            } else {
-                // The reference is there but the merchant's balance in the
-                // expected asset didn't move. Wrong mint, wrong destination, or
-                // a memo-only transaction. Never credit on the reference alone.
-                println!(
-                    "[{}] tx {} carries reference for invoice {} but no {} credit to {} — ignored",
+        if !inv.slot_is_plausible(tx.slot) {
+            return out;
+        }
+
+        let merchant_credit = tx.credit(&inv.merchant_target, inv.mint.as_deref());
+
+        if out.iter().any(|(i, _, _)| i.invoice_id == inv.invoice_id) {
+            // Already booked on the direct path. Happens whenever the payer took
+            // the naive route, because for a native invoice the reference key
+            // and the deposit address are the same account.
+            if merchant_credit > 0 {
+                eprintln!(
+                    "[{}] tx {} paid invoice {} on the direct path AND moved {} into the \
+                     merchant wallet {}. Only the direct leg is credited — a single \
+                     transaction that splits across both paths needs manual review.",
                     self.network_name,
                     tx.signature,
                     inv.invoice_id,
-                    inv.mint.as_deref().unwrap_or("SOL"),
+                    merchant_credit,
                     inv.merchant_target
                 );
             }
+            return out;
+        }
+
+        if merchant_credit > 0 {
+            match i128_to_decimal(merchant_credit) {
+                Ok(d) => out.push((inv, d, "reference")),
+                Err(e) => eprintln!(
+                    "[{}] amount overflow on {}: {e}",
+                    self.network_name, tx.signature
+                ),
+            }
+        } else {
+            // Reference present but the merchant's balance in the expected asset
+            // didn't move: wrong mint, wrong destination, or memo-only. Never
+            // credit on the reference alone.
+            println!(
+                "[{}] tx {} carries reference for invoice {} but no {} credit to {} — ignored",
+                self.network_name,
+                tx.signature,
+                inv.invoice_id,
+                inv.mint.as_deref().unwrap_or("SOLANA"),
+                inv.merchant_target
+            );
         }
 
         out
     }
 
-    /// Record every credit this transaction produced.
+    /// Record every credit this transaction produced, and return the invoices it
+    /// touched so the caller can recompute their totals once.
     ///
-    /// Idempotent on (invoice_id, signature): rescanning the unfinalized window
-    /// every tick hits the ON CONFLICT path and does nothing. The only UPDATE
-    /// that can fire is the un-orphan / relocate case, for a transaction that
-    /// was dropped and then re-landed.
+    /// One database transaction for the whole signature, not one per credit.
+    /// That matters because `tick` now skips re-fetching signatures that are
+    /// already on record: a half-committed transaction would leave one invoice
+    /// credited and the other permanently skipped.
+    ///
+    /// Idempotent on (invoice_id, tx_hash): the every-tick rescan of the
+    /// unfinalized window hits ON CONFLICT and does nothing. The only UPDATE
+    /// that can fire is the un-orphan case, for a transaction that was dropped
+    /// and then re-landed.
     async fn apply_transaction(
         &self,
         pool: &PgPool,
         tx: &TxView,
         watched: &[WatchedInvoice],
-    ) -> Result<(), String> {
+    ) -> Result<Vec<Uuid>, String> {
         let credits = self.classify(tx, watched);
+        if credits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut db_tx = pool
+            .begin()
+            .await
+            .map_err(|e| format!("apply_transaction begin tx: {e}"))?;
+
+        let mut touched = Vec::with_capacity(credits.len());
 
         for (inv, amount, path) in credits {
-            let mut db_tx = pool
-                .begin()
-                .await
-                .map_err(|e| format!("apply_transaction begin tx: {e}"))?;
-
             let inserted = sqlx::query(
                 r#"
                 INSERT INTO payments
@@ -1000,12 +1069,13 @@ impl SolanaNetwork {
 
             if inserted {
                 println!(
-                    "[{}] detected {} {} via {} path -> invoice {} (sig {}, slot {})",
+                    "[{}] detected {} {} via {} path -> invoice {} (merchant {}, sig {}, slot {})",
                     self.network_name,
                     amount,
                     inv.mint.as_deref().unwrap_or("lamports"),
                     path,
                     inv.invoice_id,
+                    inv.merchant_id,
                     tx.signature,
                     tx.slot
                 );
@@ -1028,17 +1098,17 @@ impl SolanaNetwork {
                 )
                     .await?;
             } else {
-                // Seen before. The only thing worth writing is a resurrection:
-                // a transaction we orphaned that has since re-landed. Amount is
+                // Seen before. The only thing worth writing is a resurrection: a
+                // transaction we orphaned that has since re-landed. The amount is
                 // never rewritten — the same signature always moved the same
-                // money, and letting it change would let a replay inflate a
-                // total.
+                // money, and letting it change would let a replay inflate a total.
                 sqlx::query(
                     r#"
                     UPDATE payments
                        SET block_number = $2,
                            status = 'detected',
                            confirmations = $3,
+                           payment_path = COALESCE(payment_path, $5),
                            updated_at = now()
                      WHERE invoice_id = $1
                        AND tx_hash = $4
@@ -1049,37 +1119,36 @@ impl SolanaNetwork {
                     .bind(tx.slot)
                     .bind(CONF_DETECTED)
                     .bind(&tx.signature)
+                    .bind(path)
                     .execute(&mut *db_tx)
                     .await
                     .map_err(|e| format!("relocate payment: {e}"))?;
             }
 
-            db_tx
-                .commit()
-                .await
-                .map_err(|e| format!("apply_transaction commit: {e}"))?;
-
-            self.recompute_invoice_totals(pool, inv.invoice_id, std::slice::from_ref(inv))
-                .await?;
+            touched.push(inv.invoice_id);
         }
 
-        Ok(())
+        db_tx
+            .commit()
+            .await
+            .map_err(|e| format!("apply_transaction commit: {e}"))?;
+
+        Ok(touched)
     }
 
     // ── Confirmation / finality ──────────────────────────────────────────────
 
     /// The Solana analogue of `refresh_confirmations` + `handle_reorg`, folded
-    /// into one pass because on Solana they're the same question:
-    /// "what does the cluster currently think of this signature?"
+    /// into one pass, because here they're the same question: what does the
+    /// cluster currently think of this signature?
     ///
     ///   status == null && slot <= finalized  -> dropped for good  -> orphaned
     ///   status.err != null                   -> landed but failed -> orphaned
     ///   confirmationStatus                   -> the level it reached
     ///
-    /// A transaction that got re-landed on a different fork keeps its signature
-    /// and is simply found again — there is no EVM-style "re-mined into another
-    /// block" case to write code for, because the signature is the identity,
-    /// not the (block, index) pair.
+    /// A re-landed transaction keeps its signature and is simply found again;
+    /// there's no EVM-style "re-mined into another block" case, because the
+    /// signature is the identity, not the (block, index) pair.
     async fn reconcile_statuses(
         &self,
         pool: &PgPool,
@@ -1094,8 +1163,8 @@ impl SolanaNetwork {
         let thresholds: HashMap<Uuid, ConfirmLevel> =
             watched.iter().map(|w| (w.invoice_id, w.level)).collect();
 
-        // Anything already `system_confirmed` is finalized and irreversible —
-        // it never needs looking at again. That's what keeps this bounded.
+        // `system_confirmed` is finalized and irreversible — never looked at
+        // again. That's what keeps this bounded.
         let rows = sqlx::query_as::<_, (Uuid, Uuid, String, i64, String)>(
             r#"
             SELECT p.id, p.invoice_id, p.tx_hash, p.block_number, p.status
@@ -1114,35 +1183,62 @@ impl SolanaNetwork {
             return Ok(());
         }
 
+        // `searchTransactionHistory` makes the node fall back to the ledger/
+        // bigtable, which several providers bill separately and rate-limit
+        // hard. Recent signatures are in the status cache, so split the batches
+        // by age instead of paying for the expensive lookup every 2 seconds.
+        let (recent, old): (Vec<_>, Vec<_>) = rows
+            .iter()
+            .partition(|r| r.3 > finalized_slot - RECENT_STATUS_WINDOW_SLOTS);
+
         let mut touched_invoices: HashSet<Uuid> = HashSet::new();
 
-        for chunk in rows.chunks(MAX_STATUS_PER_BATCH) {
-            let sigs: Vec<&str> = chunk.iter().map(|r| r.2.as_str()).collect();
+        for (group, search_history) in [(recent, false), (old, true)] {
+            for chunk in group.chunks(MAX_STATUS_PER_BATCH) {
+                let sigs: Vec<&str> = chunk.iter().map(|r| r.2.as_str()).collect();
 
-            let res = self
-                .rpc(
-                    "getSignatureStatuses",
-                    json!([sigs, { "searchTransactionHistory": true }]),
-                )
-                .await?;
+                let res = self
+                    .rpc(
+                        "getSignatureStatuses",
+                        json!([sigs, { "searchTransactionHistory": search_history }]),
+                    )
+                    .await?;
 
-            let statuses = res
-                .get("value")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| "getSignatureStatuses returned no value array".to_string())?;
+                let statuses = res
+                    .get("value")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| "getSignatureStatuses returned no value array".to_string())?;
 
-            for ((payment_id, invoice_id, signature, slot, status), st) in
-                chunk.iter().zip(statuses)
-            {
-                let Some(level_target) = thresholds.get(invoice_id).copied() else { continue };
-                touched_invoices.insert(*invoice_id);
+                for ((payment_id, invoice_id, signature, slot, status), st) in
+                    chunk.iter().zip(statuses)
+                {
+                    let Some(level_target) = thresholds.get(invoice_id).copied() else { continue };
+                    touched_invoices.insert(*invoice_id);
 
-                // ── dropped ──
-                if st.is_null() {
-                    // Below the finalized root and the cluster has never heard
-                    // of it: it is gone and cannot come back. Above the root,
-                    // it may just be propagating — leave it alone.
-                    if *slot <= finalized_slot {
+                    // ── dropped ──
+                    if st.is_null() {
+                        // Below the finalized root and the cluster has never
+                        // heard of it: gone, can't come back. Above the root it
+                        // may just be propagating — leave it. When we only asked
+                        // the status cache, a null is not evidence of anything,
+                        // so only trust it on the history-searching pass.
+                        if search_history && *slot <= finalized_slot {
+                            self.orphan_payment(
+                                pool,
+                                *payment_id,
+                                *invoice_id,
+                                signature,
+                                *slot,
+                                status,
+                                "dropped before finalization",
+                            )
+                                .await?;
+                        }
+                        continue;
+                    }
+
+                    // ── landed but the transaction itself failed ──
+                    if st.get("err").map(|v| !v.is_null()).unwrap_or(false) {
                         self.orphan_payment(
                             pool,
                             *payment_id,
@@ -1150,47 +1246,32 @@ impl SolanaNetwork {
                             signature,
                             *slot,
                             status,
-                            "dropped before finalization",
+                            "transaction failed on-chain",
                         )
                             .await?;
+                        continue;
                     }
-                    continue;
-                }
 
-                // ── landed but the transaction itself failed ──
-                if st.get("err").map(|v| !v.is_null()).unwrap_or(false) {
-                    self.orphan_payment(
+                    let Some(reached) = st
+                        .get("confirmationStatus")
+                        .and_then(|v| v.as_str())
+                        .and_then(ConfirmLevel::from_rpc)
+                    else {
+                        continue;
+                    };
+
+                    self.promote_payment(
                         pool,
                         *payment_id,
                         *invoice_id,
                         signature,
                         *slot,
                         status,
-                        "transaction failed on-chain",
+                        reached,
+                        level_target,
                     )
                         .await?;
-                    continue;
                 }
-
-                let Some(reached) = st
-                    .get("confirmationStatus")
-                    .and_then(|v| v.as_str())
-                    .and_then(ConfirmLevel::from_rpc)
-                else {
-                    continue;
-                };
-
-                self.promote_payment(
-                    pool,
-                    *payment_id,
-                    *invoice_id,
-                    signature,
-                    *slot,
-                    status,
-                    reached,
-                    level_target,
-                )
-                    .await?;
             }
         }
 
@@ -1221,7 +1302,7 @@ impl SolanaNetwork {
             r#"
             UPDATE payments
                SET confirmations = $2, updated_at = now()
-             WHERE id = $1 AND confirmations <> $2
+             WHERE id = $1 AND confirmations <> $2 AND status <> 'orphaned'
             "#,
         )
             .bind(payment_id)
@@ -1285,8 +1366,10 @@ impl SolanaNetwork {
         }
 
         // ── finality ─────────────────────────────────────────────────────────
-        // Terminal. Once the cluster roots a slot it cannot be undone, so this
-        // is also what drops the payment out of `reconcile_statuses` forever.
+        // Terminal. Once the cluster roots a slot it can't be undone, so this is
+        // also what drops the payment out of `reconcile_statuses` forever. The
+        // `status <> 'orphaned'` guard matters: without it a row we orphaned
+        // earlier in this same pass could be resurrected by a stale status read.
         if reached == ConfirmLevel::Finalized {
             let finalized = sqlx::query(
                 r#"
@@ -1294,7 +1377,8 @@ impl SolanaNetwork {
                    SET status = 'system_confirmed',
                        confirmations = $2,
                        updated_at = now()
-                 WHERE id = $1 AND status <> 'system_confirmed'
+                 WHERE id = $1
+                   AND status NOT IN ('system_confirmed', 'orphaned')
                 "#,
             )
                 .bind(payment_id)
@@ -1342,8 +1426,7 @@ impl SolanaNetwork {
     }
 
     /// The one case that always notifies the merchant: money we told them about
-    /// is gone, so anything they shipped on the back of it has to be walked
-    /// back on their side.
+    /// is gone, so anything they shipped against it has to be walked back.
     #[allow(clippy::too_many_arguments)]
     async fn orphan_payment(
         &self,
@@ -1391,8 +1474,8 @@ impl SolanaNetwork {
         fields.insert("PreviousStatus".into(), json!(previous_status));
         fields.insert("Reason".into(), json!(reason));
 
-        // TODO: skip this call entirely once merchant webhook settings exist
-        //       and this merchant has opted out of orphaned notifications.
+        // TODO: skip entirely once merchant webhook settings exist and this
+        //       merchant has opted out of orphaned notifications.
         enqueue_webhook(
             &mut tx,
             invoice_id,
@@ -1411,17 +1494,16 @@ impl SolanaNetwork {
 
     // ── Invoice totals ───────────────────────────────────────────────────────
 
-    /// Rebuild invoices.amount_received / status from the non-orphaned payments.
-    /// Always a full recompute, never a delta, so rescans, duplicate ticks and
-    /// dropped transactions all converge on the same number.
+    /// Rebuild invoices.amount_received / status / tx_hash from the non-orphaned
+    /// payments. Always a full recompute, never a delta, so rescans, duplicate
+    /// ticks and dropped transactions all converge on the same number.
     ///
     /// This is also where multi-transfer underpayment resolves itself: three
-    /// partial sends to the deposit address are three payment rows summing to
-    /// the requested amount, and the invoice flips 'underpaid' -> 'paid' on the
-    /// third without any special casing. The reference path is expected to be a
-    /// single WalletConnect transaction, but it goes through exactly the same
-    /// arithmetic, so a partial there behaves identically instead of being a
-    /// code path nobody ever tested.
+    /// partial sends to the deposit address are three payment rows summing to the
+    /// requested amount, and the invoice flips 'underpaid' -> 'paid' on the third
+    /// with no special casing. The reference path is expected to be a single
+    /// wallet transaction, but it goes through identical arithmetic, so a partial
+    /// there behaves the same instead of being a code path nobody tested.
     async fn recompute_invoice_totals(
         &self,
         pool: &PgPool,
@@ -1432,12 +1514,17 @@ impl SolanaNetwork {
             return Ok(());
         };
 
-        let received = sqlx::query_scalar::<_, Decimal>(
+        let (received, first_tx) = sqlx::query_as::<_, (Decimal, Option<String>)>(
             r#"
-        SELECT COALESCE(SUM(amount), 0)
-          FROM payments
-         WHERE invoice_id = $1 AND status <> 'orphaned'
-        "#,
+            SELECT COALESCE(SUM(amount), 0),
+                   (SELECT tx_hash
+                      FROM payments
+                     WHERE invoice_id = $1 AND status <> 'orphaned'
+                     ORDER BY block_number ASC, created_at ASC
+                     LIMIT 1)
+              FROM payments
+             WHERE invoice_id = $1 AND status <> 'orphaned'
+            "#,
         )
             .bind(invoice_id)
             .fetch_one(pool)
@@ -1454,67 +1541,72 @@ impl SolanaNetwork {
 
         let status_change = sqlx::query_as::<_, (String, String)>(
             r#"
-        WITH old AS (SELECT status AS prev FROM invoices WHERE id = $1)
-        UPDATE invoices i
-           SET amount_received = $2,
-               status = CASE WHEN i.status = 'expired' THEN i.status ELSE $3 END,
-               updated_at = now()
-          FROM old
-         WHERE i.id = $1
-           AND (i.amount_received <> $2 OR (i.status <> $3 AND i.status <> 'expired'))
-        RETURNING old.prev, i.status
-        "#,
+            WITH old AS (SELECT status AS prev FROM invoices WHERE id = $1)
+            UPDATE invoices i
+               SET amount_received = $2,
+                   tx_hash = $4,
+                   status = CASE WHEN i.status = 'expired' THEN i.status ELSE $3 END,
+                   updated_at = now()
+              FROM old
+             WHERE i.id = $1
+               AND (
+                     i.amount_received <> $2
+                  OR i.tx_hash IS DISTINCT FROM $4
+                  OR (i.status <> $3 AND i.status <> 'expired')
+                   )
+            RETURNING old.prev, i.status
+            "#,
         )
             .bind(invoice_id)
             .bind(received)
             .bind(new_status)
+            .bind(&first_tx)
             .fetch_optional(pool)
             .await
             .map_err(|e| format!("update invoice totals: {e}"))?;
 
-        if let Some((prev, current)) = status_change {
-            let was_settled = matches!(prev.as_str(), "paid" | "overpaid");
-            let is_settled  = matches!(current.as_str(), "paid" | "overpaid");
+        let Some((prev, current)) = status_change else { return Ok(()) };
 
-            if is_settled && !was_settled {
-                println!(
-                    "[{}] invoice {} settled: received {} / requested {} ({})",
-                    self.network_name, invoice_id, received, inv.amount_requested, current
-                );
+        let was_settled = matches!(prev.as_str(), "paid" | "overpaid");
+        let is_settled = matches!(current.as_str(), "paid" | "overpaid");
 
-                let mut tx = pool
-                    .begin()
-                    .await
-                    .map_err(|e| format!("recompute begin tx: {e}"))?;
+        if is_settled && !was_settled {
+            println!(
+                "[{}] invoice {} settled: received {} / requested {} ({})",
+                self.network_name, invoice_id, received, inv.amount_requested, current
+            );
 
-                let mut fields = Map::new();
-                fields.insert("AmountReceived".into(), json!(received.to_string()));
-                fields.insert("AmountRequested".into(), json!(inv.amount_requested.to_string()));
-                fields.insert("Overpaid".into(), json!(current == "overpaid"));
-                fields.insert("Mint".into(), json!(inv.mint));
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| format!("recompute begin tx: {e}"))?;
 
-                let dedupe_key = format!("{}:{}", invoice_id, current);
-                enqueue_webhook(&mut tx, invoice_id, "payment.finished", &dedupe_key, fields).await?;
+            let mut fields = Map::new();
+            fields.insert("AmountReceived".into(), json!(received.to_string()));
+            fields.insert("AmountRequested".into(), json!(inv.amount_requested.to_string()));
+            fields.insert("Overpaid".into(), json!(current == "overpaid"));
+            fields.insert("Mint".into(), json!(inv.mint));
+            fields.insert("TxHash".into(), json!(first_tx));
 
-                tx.commit()
-                    .await
-                    .map_err(|e| format!("recompute commit tx: {e}"))?;
+            let dedupe_key = format!("{}:{}", invoice_id, current);
+            enqueue_webhook(&mut tx, invoice_id, "payment.finished", &dedupe_key, fields).await?;
 
-                // TODO: make the trigger policy a merchant setting:
-                //       'on_detected' (fire now, current behaviour),
-                //       'on_confirmed' (every contributing payment must be
-                //       merchant_confirmed first), or 'on_finalized'.
-                // TODO: underpaid tolerance (dust / rounding) belongs here too,
-                //       currently strict >=.
-            } else if !is_settled && was_settled {
-                // A dropped transaction clawed us back below the requested
-                // amount. payment.orphaned already explained why, so no second
-                // event here.
-                println!(
-                    "[{}] invoice {} fell back to {} after an orphan (received {})",
-                    self.network_name, invoice_id, current, received
-                );
-            }
+            tx.commit()
+                .await
+                .map_err(|e| format!("recompute commit tx: {e}"))?;
+
+            // TODO: make the trigger policy a merchant setting: 'on_detected'
+            //       (current), 'on_confirmed' (every contributing payment must be
+            //       merchant_confirmed first), or 'on_finalized'.
+            // TODO: underpaid tolerance (dust / rounding) belongs here too;
+            //       currently strict >=.
+        } else if !is_settled && was_settled {
+            // A dropped transaction clawed us back below the requested amount.
+            // payment.orphaned already explained why, so no second event.
+            println!(
+                "[{}] invoice {} fell back to {} after an orphan (received {})",
+                self.network_name, invoice_id, current, received
+            );
         }
 
         Ok(())
@@ -1522,60 +1614,77 @@ impl SolanaNetwork {
 
     // ── Loading / scan state ─────────────────────────────────────────────────
 
-    /// Everything worth watching: live invoices, plus dead invoices that still
-    /// have payments counting toward a level. Same shape as the EVM scan plan,
-    /// minus the block-range arithmetic — on Solana the "range" is just
-    /// "whatever is newer than this address's cursor".
+    /// Live invoices, plus dead invoices that still have payments counting
+    /// toward a level.
+    ///
+    /// `merchant_target` is not a column: it's the merchant's main Solana wallet
+    /// (native) or that wallet's ATA for the mint (SPL). The wallet comes from
+    /// `merchant_wallets`, which stores network_type = 'solana'
+    /// that `invoices.network_type` uses. Binding the same parameter to both was
+    /// silently disabling the reference path for every invoice, because the LEFT
+    /// JOIN produced NULL and `merchant_target` came out empty.
     async fn load_watched_invoices(&self, pool: &PgPool) -> Result<Vec<WatchedInvoice>, String> {
-        // merchant_target is not a column — it's the merchant's main solana wallet
-        // (native) or that wallet's ATA for the mint (SPL). We fetch the wallet via
-        // merchant_wallets and derive the ATA in Rust.
         let rows = sqlx::query_as::<
-            _,
-            (
-                Uuid,           // id
-                Uuid,           // merchant_id
-                String,         // wallet_address (deposit target)
-                Option<String>, // payment_reference
-                Option<String>, // merchant main wallet (nullable if unconfigured)
-                Decimal,        // amount_requested
-                Option<String>, // token_address (mint; null/"0"/"" => native)
-                Option<i16>,    // required_confirmations
-                Option<i64>,    // created_block
-            ),
+        _,
+        (
+            Uuid,           // id
+            Uuid,           // merchant_id
+            String,         // wallet_address (deposit target)
+            Option<String>, // payment_reference
+            Option<String>, // merchant main wallet
+            Decimal,        // amount_requested
+            Option<String>, // token_address (mint; null/"0"/"" => native)
+            Option<String>, // token_program (owner program of the mint)
+            Option<i16>,    // required_confirmations
+            Option<i64>,    // created_block
+        ),
         >(
             r#"
-        SELECT i.id,
-               i.merchant_id,
-               i.wallet_address,
-               i.payment_reference,
-               mw.address,
-               i.amount_requested,
-               i.token_address,
-               i.required_confirmations,
-               i.created_block
-          FROM invoices i
-          LEFT JOIN merchant_wallets mw
-                 ON mw.merchant_id = i.merchant_id
-                AND mw.network_type = $1
-         WHERE i.network_type = $1
-           AND i.chain_ref = $2
-           AND i.wallet_address IS NOT NULL
-           AND (
-                 (i.status IN ('pending','underpaid') AND i.expires_at > now())
-              OR EXISTS (
-                   SELECT 1 FROM payments p
-                    WHERE p.invoice_id = i.id
-                      AND p.status IN ('detected','merchant_confirmed')
-                 )
-               )
-        "#,
+            SELECT i.id,
+                   i.merchant_id,
+                   i.wallet_address,
+                   i.payment_reference,
+                   mw.address,
+                   i.amount_requested,
+                   i.token_address,
+                   i.token_program,
+                   i.required_confirmations,
+                   i.created_block
+              FROM invoices i
+              LEFT JOIN merchant_wallets mw
+                     ON mw.merchant_id = i.merchant_id
+                    AND mw.network_type = $3
+             WHERE i.network_type = $1
+               AND i.chain_ref = $2
+               AND i.wallet_address IS NOT NULL
+               AND i.wallet_address <> ''
+               AND (
+                     (i.status IN ('pending','underpaid') AND i.expires_at > now())
+                  OR EXISTS (
+                       SELECT 1 FROM payments p
+                        WHERE p.invoice_id = i.id
+                          AND p.status IN ('detected','merchant_confirmed')
+                     )
+                   )
+             ORDER BY i.created_at ASC
+             LIMIT $4
+            "#,
         )
             .bind(NETWORK_TYPE)
             .bind(self.chain_ref())
+            .bind(MERCHANT_WALLET_NETWORK)
+            .bind(MAX_WATCHED_INVOICES)
             .fetch_all(pool)
             .await
             .map_err(|e| format!("load_watched_invoices: {e}"))?;
+
+        if rows.len() as i64 == MAX_WATCHED_INVOICES {
+            eprintln!(
+                "[{}] watch set hit the {MAX_WATCHED_INVOICES} cap — the oldest invoices are \
+                 being polled and newer ones are starved. Shard the watcher or raise the cap.",
+                self.network_name
+            );
+        }
 
         let mut out = Vec::with_capacity(rows.len());
         for (
@@ -1586,25 +1695,52 @@ impl SolanaNetwork {
             merchant_wallet,
             amount_requested,
             mint_raw,
+            token_program_raw,
             required_confirmations,
             created_slot,
         ) in rows
         {
             // Creation stores NULL for native; be defensive about "0"/"" too.
             let mint = mint_raw.filter(|m| !m.is_empty() && m != "0");
+            let token_program = token_program_raw.filter(|p| !p.is_empty() && p != "0");
             let payment_reference = payment_reference.unwrap_or_default();
 
-            let merchant_target = match (&merchant_wallet, &mint) {
-                (Some(w), None)    => w.clone(),
-                (Some(w), Some(m)) => derive_associated_token_address(w, m).unwrap_or_default(),
-                (None, _)          => String::new(), // no wallet configured -> reference path inert
+            // A mint with no program on the row predates the token_program column or
+            // was written by a broken creation path. Skipping the invoice entirely is
+            // wrong (the direct path may still be collecting), but we refuse to guess
+            // the program: a legacy-SPL default would silently produce a merchant ATA
+            // nobody credits for a Token-2022 mint.
+            if mint.is_some() && token_program.is_none() {
+                eprintln!(
+                    "[{}] invoice {}: token_address is set but token_program is NULL; \
+                     reference path disabled until the row is backfilled",
+                    self.network_name, invoice_id
+                );
+            }
+
+            let merchant_target = match (&merchant_wallet, &mint, &token_program) {
+                (Some(w), None, _) => w.clone(),
+                (Some(w), Some(m), Some(p)) => match derive_associated_token_address(w, m, p) {
+                    Ok(ata) => ata,
+                    Err(e) => {
+                        eprintln!(
+                            "[{}] invoice {}: could not derive merchant ATA for wallet {w} / \
+                             mint {m} / program {p}: {e}",
+                            self.network_name, invoice_id
+                        );
+                        String::new()
+                    }
+                },
+                // Mint present, program missing — already logged above.
+                (Some(_), Some(_), None) => String::new(),
+                (None, _, _) => String::new(),
             };
 
-            if merchant_target.is_empty() {
+            if merchant_target.is_empty() && merchant_wallet.is_none() {
                 eprintln!(
-                    "[{}] invoice {} has no resolvable merchant target (missing merchant_wallets \
-                 row for 'solana'?); reference path disabled for it",
-                    self.network_name, invoice_id
+                    "[{}] invoice {} has no resolvable merchant target (no merchant_wallets row \
+                     with network_type = '{}'?); reference path disabled for it",
+                    self.network_name, invoice_id, MERCHANT_WALLET_NETWORK
                 );
             }
 
@@ -1616,6 +1752,7 @@ impl SolanaNetwork {
                 merchant_target,
                 amount_requested,
                 mint,
+                token_program,
                 level: ConfirmLevel::from_required(required_confirmations.unwrap_or(1) as i64),
                 created_slot,
             });
@@ -1623,7 +1760,6 @@ impl SolanaNetwork {
 
         Ok(out)
     }
-
 
     async fn load_address_cursor(
         &self,
@@ -1645,8 +1781,11 @@ impl SolanaNetwork {
             .map_err(|e| format!("load_address_cursor({address}): {e}"))
     }
 
-    /// Monotonic by slot: a stale worker or a late-arriving tick can never walk
-    /// the cursor backwards and cause a re-scan storm.
+    /// Monotonic by slot, so a stale worker can't walk the cursor backwards and
+    /// cause a rescan storm. `<=` rather than `<` because progress *within* a
+    /// slot has to be persistable — Solana packs many transactions per slot, and
+    /// with a strict `<` the cursor would stick to the first signature in the
+    /// slot and re-list the rest on every tick, forever.
     async fn save_address_cursor(
         &self,
         pool: &PgPool,
@@ -1663,7 +1802,7 @@ impl SolanaNetwork {
                SET last_signature = EXCLUDED.last_signature,
                    last_slot = EXCLUDED.last_slot,
                    updated_at = now()
-             WHERE network_address_cursors.last_slot < EXCLUDED.last_slot
+             WHERE network_address_cursors.last_slot <= EXCLUDED.last_slot
             "#,
         )
             .bind(NETWORK_TYPE)
@@ -1677,8 +1816,12 @@ impl SolanaNetwork {
         Ok(())
     }
 
-    /// Drop cursors for addresses that no invoice cares about any more. Without
-    /// this the table grows one row per invoice forever.
+    /// Drop cursors no live invoice cares about. Without this the table grows one
+    /// row per invoice forever.
+    ///
+    /// Bails on an empty whitelist. `address <> ALL('{}')` is TRUE for every row,
+    /// so calling this during a quiet period with nothing watched would delete
+    /// the entire cursor table and force a cold-start rescan of every address.
     async fn prune_address_cursors(
         &self,
         pool: &PgPool,
@@ -1686,10 +1829,13 @@ impl SolanaNetwork {
     ) -> Result<(), String> {
         let mut live: Vec<String> = Vec::with_capacity(watched.len() * 2);
         for w in watched {
-            live.push(w.deposit_address.clone());
-            if !w.payment_reference.is_empty() {
-                live.push(w.payment_reference.clone());
+            for a in w.watch_addresses() {
+                live.push(a.to_string());
             }
+        }
+
+        if live.is_empty() {
+            return Ok(());
         }
 
         sqlx::query(
@@ -1697,7 +1843,7 @@ impl SolanaNetwork {
             DELETE FROM network_address_cursors
              WHERE network_type = $1
                AND chain_ref = $2
-               AND address <> ALL($3)
+               AND NOT (address = ANY($3))
                AND updated_at < now() - interval '7 days'
             "#,
         )
@@ -1710,20 +1856,24 @@ impl SolanaNetwork {
         Ok(())
     }
 
-    /// Wall-clock expiry. Nothing chain-derived — an invoice expires when its
+    /// Wall-clock expiry. Nothing chain-derived: an invoice expires when its
     /// timer runs out, and any payment already recorded keeps counting toward
-    /// finality regardless (the merchant still got the money, they just have to
-    /// decide what to do about a late payer).
+    /// finality regardless.
+    ///
+    /// Covers 'underpaid' as well as 'pending'. It only covered 'pending' before,
+    /// which meant a partially-paid invoice never left the watch set: its
+    /// addresses were polled every 2 seconds until the process was restarted, and
+    /// even then it came straight back.
     async fn expire_invoices(&self, pool: &PgPool) -> Result<(), String> {
-        let expired = sqlx::query_scalar::<_, Uuid>(
+        let expired = sqlx::query_as::<_, (Uuid, Decimal, Decimal, String)>(
             r#"
             UPDATE invoices
                SET status = 'expired', updated_at = now()
              WHERE network_type = $1
                AND chain_ref = $2
-               AND status = 'pending'
+               AND status IN ('pending', 'underpaid')
                AND expires_at <= now()
-            RETURNING id
+            RETURNING id, amount_received, amount_requested, status
             "#,
         )
             .bind(NETWORK_TYPE)
@@ -1732,8 +1882,11 @@ impl SolanaNetwork {
             .await
             .map_err(|e| format!("expire_invoices: {e}"))?;
 
-        for invoice_id in expired {
-            println!("[{}] invoice {} expired unpaid", self.network_name, invoice_id);
+        for (invoice_id, received, requested, _) in expired {
+            println!(
+                "[{}] invoice {} expired (received {} / requested {})",
+                self.network_name, invoice_id, received, requested
+            );
 
             let mut tx = pool
                 .begin()
@@ -1742,6 +1895,9 @@ impl SolanaNetwork {
 
             let mut fields = Map::new();
             fields.insert("InvoiceId".into(), json!(invoice_id));
+            fields.insert("AmountReceived".into(), json!(received.to_string()));
+            fields.insert("AmountRequested".into(), json!(requested.to_string()));
+            fields.insert("PartiallyPaid".into(), json!(received > Decimal::ZERO));
 
             enqueue_webhook(
                 &mut tx,
@@ -1760,44 +1916,9 @@ impl SolanaNetwork {
         Ok(())
     }
 
-    /// Keeps the in-memory hint map from growing forever. The DB query at the
-    /// top of the tick already excludes these.
-    async fn drop_settled_from_pending(
-        &self,
-        pool: &PgPool,
-        watched: &[WatchedInvoice],
-    ) -> Result<(), String> {
-        let ids: Vec<Uuid> = watched.iter().map(|w| w.invoice_id).collect();
-        if ids.is_empty() {
-            return Ok(());
-        }
-
-        let done = sqlx::query_scalar::<_, Uuid>(
-            r#"
-            SELECT i.id FROM invoices i
-             WHERE i.id = ANY($1)
-               AND i.status <> 'pending'
-               AND NOT EXISTS (
-                   SELECT 1 FROM payments p
-                    WHERE p.invoice_id = i.id
-                      AND p.status IN ('detected', 'merchant_confirmed')
-               )
-            "#,
-        )
-            .bind(&ids)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| format!("settled invoices: {e}"))?;
-
-        if !done.is_empty() {
-            if let Ok(mut pending) = self.pending.lock() {
-                for id in done {
-                    pending.remove(&id);
-                }
-            }
-        }
-
-        Ok(())
+    pub async fn get_finalized_block(&self) -> Result<u64, String> {
+        let slot = self.get_slot(FINALIZED_COMMITMENT).await?;
+        u64::try_from(slot).map_err(|_| "getSlot returned negative".to_string())
     }
 }
 
@@ -1805,20 +1926,22 @@ impl SolanaNetwork {
 // Transaction parsing
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Reduce a `jsonParsed` transaction to balance deltas.
+/// Reduce a `jsonParsed` transaction to balance deltas plus its signer set.
 ///
-/// Deliberately does not look at instructions. Pre/post balances are the only
-/// thing that can't lie about how much money moved: they cover `transfer`,
-/// `transferChecked`, CPIs from routers and aggregators, several transfers in
-/// one transaction, and account-creation-plus-transfer in one shot. Parsing
-/// instruction shapes would mean maintaining a list of every way somebody can
-/// send you a token.
+/// Deliberately does not read instructions. Pre/post balances are the only thing
+/// that can't lie about how much money moved: they cover `transfer`,
+/// `transferChecked`, CPIs from routers and aggregators, several transfers in one
+/// transaction, and create-ATA-plus-transfer in one shot. Parsing instruction
+/// shapes would mean maintaining a list of every way somebody can send a token.
+///
+/// The signer set is the one thing we *do* need beyond balances, because it's
+/// what distinguishes an inbound payment that references our HD key from an
+/// outbound transaction our HD key authorized.
 ///
 /// `jsonParsed` merges address-lookup-table accounts into `message.accountKeys`
-/// in balance-index order, so v0 transactions need no special handling — but
-/// the account key list is still validated against the balance array length,
-/// because a provider that doesn't do the merge would otherwise silently
-/// misattribute every delta.
+/// in balance-index order, so v0 transactions need no special handling — but the
+/// key list is validated against the balance array length anyway, because a
+/// provider that skips the merge would otherwise silently misattribute deltas.
 fn parse_tx_view(signature: &str, raw: &Value) -> Result<TxView, String> {
     let slot = raw
         .get("slot")
@@ -1831,26 +1954,53 @@ fn parse_tx_view(signature: &str, raw: &Value) -> Result<TxView, String> {
 
     let failed = meta.get("err").map(|v| !v.is_null()).unwrap_or(false);
 
-    let keys_raw = raw
+    let message = raw
         .get("transaction")
         .and_then(|t| t.get("message"))
-        .and_then(|m| m.get("accountKeys"))
+        .ok_or_else(|| "transaction missing message".to_string())?;
+
+    let keys_raw = message
+        .get("accountKeys")
         .and_then(|k| k.as_array())
         .ok_or_else(|| "transaction missing accountKeys".to_string())?;
 
     let mut ordered_keys: Vec<String> = Vec::with_capacity(keys_raw.len());
+    let mut signers: HashSet<String> = HashSet::new();
+    let mut saw_signer_flag = false;
+
     for k in keys_raw {
         let pk = match k {
             // jsonParsed: { pubkey, signer, writable, source }
-            Value::Object(o) => o
-                .get("pubkey")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "accountKey object missing pubkey".to_string())?,
-            // base58 encoding fallback
+            Value::Object(o) => {
+                let pk = o
+                    .get("pubkey")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "accountKey object missing pubkey".to_string())?;
+                if let Some(true) = o.get("signer").and_then(|v| v.as_bool()) {
+                    saw_signer_flag = true;
+                    signers.insert(pk.to_string());
+                }
+                pk
+            }
+            // base58 encoding fallback — no per-key signer flag
             Value::String(s) => s.as_str(),
             _ => return Err("unexpected accountKey shape".to_string()),
         };
         ordered_keys.push(pk.to_string());
+    }
+
+    // Fallback for encodings that don't flag signers per key: by protocol the
+    // first `numRequiredSignatures` keys are the signers.
+    if !saw_signer_flag {
+        if let Some(n) = message
+            .get("header")
+            .and_then(|h| h.get("numRequiredSignatures"))
+            .and_then(|v| v.as_u64())
+        {
+            for k in ordered_keys.iter().take(n as usize) {
+                signers.insert(k.clone());
+            }
+        }
     }
 
     let account_keys: HashSet<String> = ordered_keys.iter().cloned().collect();
@@ -1873,9 +2023,8 @@ fn parse_tx_view(signature: &str, raw: &Value) -> Result<TxView, String> {
         ));
     }
     if pre.len() > ordered_keys.len() {
-        // The provider gave us balances for accounts it didn't name. Refusing
-        // is the only safe move — guessing the alignment credits the wrong
-        // address.
+        // Balances for accounts the provider didn't name. Refusing is the only
+        // safe move: guessing the alignment credits the wrong address.
         return Err(format!(
             "{signature}: {} balances but only {} account keys (lookup tables not \
              expanded by this provider)",
@@ -1896,8 +2045,8 @@ fn parse_tx_view(signature: &str, raw: &Value) -> Result<TxView, String> {
 
     // ── SPL token deltas ──
     // Keyed on (token account address, mint) rather than owner, because a
-    // transfer names the ATA, not the wallet behind it — and because that's the
-    // address the invoice actually stores and watches.
+    // transfer names the ATA, not the wallet behind it — and the ATA is what the
+    // invoice stores and watches.
     let mut token_delta: HashMap<(String, String), i128> = HashMap::new();
 
     let mut fold = |arr: Option<&Value>, sign: i128| -> Result<(), String> {
@@ -1929,14 +2078,14 @@ fn parse_tx_view(signature: &str, raw: &Value) -> Result<TxView, String> {
         slot,
         failed,
         account_keys,
+        signers,
         native_delta,
         token_delta,
     })
 }
 
 fn i128_to_decimal(v: i128) -> Result<Decimal, String> {
-    // Base units, scale 0 — decimals are a presentation-layer concern, same as
-    // the EVM side.
+    // Base units, scale 0 — decimals are a presentation-layer concern.
     Decimal::try_from_i128_with_scale(v, 0).map_err(|e| format!("amount out of Decimal range: {e}"))
 }
 
@@ -1947,10 +2096,33 @@ impl NetworkClient for SolanaNetwork {
         &self,
         pool: &PgPool,
         merchant_id: Uuid,
-        _invoice_id: Uuid,
+        invoice_id: Uuid,
         mnemonic: &str,
-        token_address: Option<&str>,
     ) -> Result<(String, u32, Option<String>), String> {
+        let invoice = sqlx::query!(
+        r#"
+        SELECT token_address, token_program
+        FROM invoices
+        WHERE id = $1
+        "#,
+        invoice_id
+    )
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("Failed to load invoice {invoice_id} for derivation: {e}"))?;
+
+        let mint = invoice.token_address.filter(|m| !m.is_empty() && m != "0");
+        let token_program = invoice.token_program.filter(|p| !p.is_empty() && p != "0");
+
+        // Fail loudly rather than defaulting to the legacy program. A wrong default
+        // produces a valid-looking address that nobody will ever pay into.
+        if mint.is_some() && token_program.is_none() {
+            return Err(format!(
+                "invoice {invoice_id}: token_address is set but token_program is NULL; \
+             refusing to guess the token program"
+            ));
+        }
+
         let row = sqlx::query!(
         r#"
         INSERT INTO merchant_network_indices (merchant_id, network, account_index, next_index)
@@ -1962,7 +2134,7 @@ impl NetworkClient for SolanaNetwork {
         RETURNING next_index
         "#,
         merchant_id,
-        self.network_name
+        "solana"
     )
             .fetch_one(pool)
             .await
@@ -1973,13 +2145,15 @@ impl NetworkClient for SolanaNetwork {
 
         // The HD-derived owner pubkey. This is simultaneously:
         //   - the deposit address, when the invoice is for native SOL
-        //   - the ATA *owner*, when the invoice is for an SPL mint
+        //   - the ATA *owner*, when the invoice is for an SPL / Token-2022 mint
         //   - the Solana Pay `reference` in both cases
         let owner_address = derive_solana_address(mnemonic, index)?;
 
-        let deposit_address = match token_address {
-            Some(mint) => derive_associated_token_address(&owner_address, mint)?,
-            None => owner_address.clone(),
+        let deposit_address = match (&mint, &token_program) {
+            (Some(mint), Some(program)) => {
+                derive_associated_token_address(&owner_address, mint, program)?
+            }
+            _ => owner_address.clone(),
         };
 
         Ok((deposit_address, index, Some(owner_address)))
@@ -2003,6 +2177,8 @@ impl NetworkClient for SolanaNetwork {
         let slot = self.get_slot(DETECT_COMMITMENT).await?;
         u64::try_from(slot).map_err(|_| "getSlot returned negative".to_string())
     }
+
+
 
     fn register_payment(&self, watch: PaymentWatch) {
         todo!()

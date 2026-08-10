@@ -6,6 +6,8 @@ use chrono::{Duration, Utc};
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
+pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+pub const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 #[derive(Debug, Clone)]
 pub struct TokenConfig {
@@ -13,7 +15,8 @@ pub struct TokenConfig {
     pub name: &'static str,
     pub detail: &'static str,
     pub info: &'static str,
-    pub token_address: Option<&'static str>, // None for native SOL
+    pub token_address: Option<&'static str>,  // None for native SOL
+    pub token_program: Option<&'static str>,  // None iff token_address is None
     pub decimals: u8,
     pub required_confirmations: i32,
 }
@@ -26,6 +29,7 @@ pub const DEVNET_TOKENS: &[TokenConfig] = &[
         detail: "(SOL) (Devnet)",
         info: "USDC stablecoin on the Solana Devnet.",
         token_address: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+        token_program: Some(TOKEN_PROGRAM_ID),
         decimals: 6,
         required_confirmations: 5,
     },
@@ -35,24 +39,33 @@ pub const DEVNET_TOKENS: &[TokenConfig] = &[
         detail: "(SOL) (Devnet)",
         info: "Tether USD stablecoin on the Solana Devnet.",
         token_address: Some("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"),
+        // Tether's USDT is a legacy SPL Token mint.
+        token_program: Some(TOKEN_PROGRAM_ID),
         decimals: 6,
         required_confirmations: 5,
     },
-    TokenConfig {
-        id: "USDS_DEVNET",
-        name: "USDS",
-        detail: "(SOL) (Devnet)",
-        info: "USDS stablecoin on the Solana Devnet.",
-        token_address: Some("FILL_ME_IN_USDS_MINT_ADDRESS"),
-        decimals: 6,
-        required_confirmations: 5,
-    },
+    // TokenConfig {
+    //     id: "USDS_DEVNET",
+    //     name: "USDS",
+    //     detail: "(SOL) (Devnet)",
+    //     info: "USDS stablecoin on the Solana Devnet.",
+    //     token_address: Some("FILL_ME_IN_USDS_MINT_ADDRESS"),
+    //     // VERIFY ME: USDS (Sky/Maker) on Solana is, to my knowledge, a Token-2022
+    //     // mint — this is exactly the case the reviewer was warning about. Confirm by
+    //     // fetching the mint account and checking its `owner` field before going live:
+    //     //   solana account <USDS_MINT> --output json | jq -r .account.owner
+    //     // Expect TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb for Token-2022.
+    //     token_program: Some(TOKEN_2022_PROGRAM_ID),
+    //     decimals: 6,
+    //     required_confirmations: 5,
+    // },
     TokenConfig {
         id: "SOL_DEVNET",
         name: "SOL",
         detail: "(SOL) (Devnet)",
         info: "Native Solana coin on the Devnet.",
         token_address: None,
+        token_program: None,
         decimals: 9,
         required_confirmations: 5,
     },
@@ -103,7 +116,6 @@ impl TokenHandler for DevnetHandler {
         _amount: rust_decimal::Decimal,
         _token_id: &str,
     ) -> Result<PaymentDetails, String> {
-        // 1. Retrieve and parse MASTER_KEY from environment
         let master_key_hex = std::env::var("MASTER_KEY")
             .map_err(|_| "MASTER_KEY environment variable not set".to_string())?;
 
@@ -115,20 +127,18 @@ impl TokenHandler for DevnetHandler {
             .try_into()
             .map_err(|_| "MASTER_KEY must be exactly 32 bytes (64 hex characters)".to_string())?;
 
-        // 2. Fetch encrypted key material from the DB for this merchant
         let key_material = sqlx::query!(
-            r#"
-            SELECT encrypted_secret, encryption_nonce
-            FROM merchant_key_material
-            WHERE merchant_id = $1 AND key_family = 'bip39'
-            "#,
-            merchant_id
-        )
+        r#"
+        SELECT encrypted_secret, encryption_nonce
+        FROM merchant_key_material
+        WHERE merchant_id = $1 AND key_family = 'bip39'
+        "#,
+        merchant_id
+    )
             .fetch_one(pool)
             .await
             .map_err(|e| format!("Failed to fetch key material for merchant {merchant_id}: {e}"))?;
 
-        // 3. Decrypt the merchant BIP39 mnemonic
         let decrypted_bytes = decrypt_data(
             master_key,
             &key_material.encrypted_secret,
@@ -138,66 +148,129 @@ impl TokenHandler for DevnetHandler {
         let merchant_mnemonic = String::from_utf8(decrypted_bytes)
             .map_err(|e| format!("Invalid UTF-8 sequence in decrypted mnemonic: {e}"))?;
 
-        // 4. Derive wallet address and payment reference using decrypted mnemonic
-        // Extract token address for DB assignment
-        let token_address = self.config.token_address.as_ref().map(ToString::to_string);
+        // Normalise here rather than defending against "0"/"" in five places
+        // downstream. NULL is the only representation of "native" the DB should hold.
+        let token_address = self
+            .config
+            .token_address
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|m| !m.is_empty() && m != "0");
+
+        // Native SOL carries no token program. For a mint, the program is what
+        // decides the ATA, so a missing one is a config bug, not a default.
+        let token_program = match &token_address {
+            None => None,
+            Some(_) => match self.config.token_program {
+                Some(p) if !p.is_empty() => Some(p.to_string()),
+                _ => {
+                    return Err(format!(
+                        "token {} has a mint configured but no token_program; refusing to create \
+                         invoice {invoice_id} with an unguessable ATA",
+                        self.config.id
+                    ))
+                }
+            },
+        };
+
+        // The reference path is dead without this row, so surface it at creation
+        // time instead of letting the watcher log about it once per tick forever.
+        let merchant_wallet = sqlx::query_scalar!(
+        r#"
+        SELECT address FROM merchant_wallets
+        WHERE merchant_id = $1 AND network_type = 'solana'
+        "#,
+        merchant_id
+    )
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("Failed to look up merchant wallet: {e}"))?;
+
+        if merchant_wallet.is_none() {
+            eprintln!(
+                "merchant {merchant_id} has no merchant_wallets row for 'sol'; invoice \
+             {invoice_id} will only be payable via the direct/QR path"
+            );
+        }
+
+        // Written before derivation: get_derive_address reads these two columns back
+        // off the row to decide which program the ATA is derived under. The invoice
+        // is not yet visible to the watcher — its wallet_address is still NULL/'' —
+        // so a crash between this statement and the one below leaves a row that is
+        // never polled and simply expires.
+        sqlx::query!(
+        r#"
+        UPDATE invoices
+        SET token_address = $1,
+            token_program = $2,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $3
+        "#,
+        token_address,
+        token_program,
+        invoice_id
+    )
+            .execute(pool)
+            .await
+            .map_err(|e| format!("Failed to set token fields on invoice {invoice_id}: {e}"))?;
 
         let (deposit_address, derived_wallet_index, payment_reference) = self
             .network
-            .get_derive_address(pool, merchant_id, invoice_id, &merchant_mnemonic, token_address.as_deref())
+            .get_derive_address(pool, merchant_id, invoice_id, &merchant_mnemonic)
             .await
             .map_err(|e| format!("Address derivation failed: {e}"))?;
 
         let expires_at = Utc::now() + Duration::minutes(30);
 
-
-        // NOTE: adjust this to whatever SolanaNetwork exposes for the current
-        // slot height (e.g. get_current_slot()) if the method name differs.
+        // Deliberately the FINALIZED slot, not the processed/confirmed tip.
+        // `created_block` is used as a floor: any transaction below it is discarded
+        // as predating the invoice. A tip reading can sit ahead of where the payer's
+        // transaction lands, which would throw away a real payment. Finalized is
+        // always behind, so erring here costs a few extra signatures to scan.
         let current_slot = self
             .network
-            .get_current_block()
+            .get_finalized_block()
             .await
-            .map_err(|e| format!("Failed to fetch current slot: {e}"))? as i64; // adjust type to match column
+            .map_err(|e| format!("Failed to fetch finalized slot: {e}"))? as i64;
 
         let network_type = "solana";
-        let chain_ref = "devnet";
+        let chain_ref = self.network.chain_ref(); // was hardcoded "devnet"
 
-        // 5. Update invoice record with derived address details and configuration metadata
+        // token_address / token_program are already committed above; setting
+        // wallet_address here is what makes the invoice visible to the watcher.
         sqlx::query!(
         r#"
-            UPDATE invoices
-            SET wallet_address = $1,
-                wallet_index = $2,
-                expires_at = $3,
-                payment_reference = $4,
-                token_address = $5,
-                token_decimals = $6,
-                required_confirmations = $7,
-                network_type = $8,
-                chain_ref = $9,
-                created_block = $10,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $11
-            "#,
-            deposit_address,
-            derived_wallet_index as i32,
-            expires_at,
-            payment_reference,
-            token_address,
-            self.config.decimals as i16,
-            self.config.required_confirmations as i16,
-            network_type,
-            chain_ref,
-            current_slot,
-            invoice_id
-        )
+        UPDATE invoices
+        SET wallet_address = $1,
+            wallet_index = $2,
+            expires_at = $3,
+            payment_reference = $4,
+            token_decimals = $5,
+            required_confirmations = $6,
+            network_type = $7,
+            chain_ref = $8,
+            created_block = $9,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $10
+        "#,
+        deposit_address,
+        derived_wallet_index as i32,
+        expires_at,
+        payment_reference,
+        self.config.decimals as i16,
+        self.config.required_confirmations as i16,
+        network_type,
+        chain_ref,
+        current_slot,
+        invoice_id
+    )
             .execute(pool)
             .await
             .map_err(|e| format!("DB update failed: {e}"))?;
 
         Ok(PaymentDetails {
             invoice_id,
-            network: "devnet".to_string(),
+            network: chain_ref,
             deposit_address,
             token_address,
             decimals: self.config.decimals,
@@ -206,7 +279,6 @@ impl TokenHandler for DevnetHandler {
             expires_at,
         })
     }
-
     async fn cancel_payment(&self, _pool: &PgPool, invoice_id: Uuid) -> Result<(), String> {
         println!("DevnetHandler::cancel_payment({invoice_id}) for token: {}", self.config.id);
         Ok(())

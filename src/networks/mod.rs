@@ -207,7 +207,7 @@ pub struct Amount(pub u128);
 
 #[async_trait]
 pub trait NetworkClient: Send + Sync {
-    async fn get_derive_address(&self, pool: &PgPool, merchant_id: Uuid, invoice_id: Uuid, mnemonic: &str, token_address: Option<&str>) -> Result<(String, u32, Option<String>), String>;
+    async fn get_derive_address(&self, pool: &PgPool, merchant_id: Uuid, invoice_id: Uuid, mnemonic: &str) -> Result<(String, u32, Option<String>), String>;
     fn validate_address(&self, address: &str) -> bool;
     async fn get_native_balance(&self, address: &str) -> Result<Amount, String>;
     async fn get_token_balance(&self, token_address: &str, address: &str, decimals: u8) -> Result<Amount, String>;
