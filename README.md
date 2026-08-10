@@ -43,18 +43,21 @@ It is also a learning project — a way to get hands-on with HD wallet derivatio
 
 ## Roadmap & timeline
 
-The project is being built in deliberate phases. Each phase is completed and stabilized before the next begins, because each later phase depends on the trait surface the earlier ones settle.
-
 ### ✅ Phase 1 — Observing *(complete)*
 
 The full path from "create an invoice" to "tell the merchant it was paid": an invoice can be created, its payment observed through either of the dual payment paths (naive QR or WalletConnect), the resulting events ingested, and the webhook delivered to the merchant's URL.
 
 - [x] Overall architecture: the network-agnostic orchestrator and the `NetworkClient` / `TokenHandler` traits
 - [x] Network and token registration system
-- [x] Network implementations — **EVM** is the development network; Solana and Esplora will be modeled once observing *and* sweeping are done and the full set of traits a network must satisfy for both steps is known
+- [x] Network implementation — **EVM**, fully tested as the development network
 - [x] Webhook delivery (at-least-once, retried, transactional with state changes)
+### 🚧 Phase 2 — Network expansion: Solana & Esplora *(in progress)*
 
-### 🚧 Phase 2 — Sweeping *(in progress)*
+Before continuing into sweeping and ledgering, the observing layer is being extended to the two remaining planned networks. This confirms the `NetworkClient` / `TokenHandler` trait surface actually holds up across a non-EVM account model (Solana) and a UTXO model (Esplora) before more is built on top of it.
+
+- [ ] **Solana** network implementation — actively in progress, mostly done but not yet finished
+- [ ] **Esplora** (Bitcoin-style UTXO) network implementation — up next after Solana
+### 🔜 Phase 3 — Sweeping & ledgering
 
 Moving funds from per-invoice deposit addresses to merchant main accounts, and accounting for every unit of value while doing it. The design sketch of the ledgering system is done — see [`LEDGER.md`](./LEDGER.md).
 
@@ -63,34 +66,21 @@ Moving funds from per-invoice deposit addresses to merchant main accounts, and a
 - [ ] Gas refilling mechanics for deposit addresses that need native token to move ERC-20s
 - [ ] Full ledgering system implementation (`chain_transactions`, `chain_movements`, journals/entries)
 - [ ] Orchestrator endpoints to trigger sweeps manually and to configure the conditions under which they happen automatically
-
-### 🔜 Phase 3 — Hardening
+### 🔜 Phase 4 — Hardening
 
 - [ ] Proper audit pass over the whole codebase
-- [ ] Solana network implementation
-- [ ] Esplora (Bitcoin-style UTXO) network implementation
+### 🔜 Phase 5 — Containerization
 
-### 🔜 Phase 4 — Containerization
-
-- [ ] Package and document everything so others can deploy their own instance
-
-### 🌱 Future improvements
-
-Beyond the core phases, in no particular order:
-
-- Proper statistics dashboards for operators and merchants
-- More payment types — an embeddable widget, embedded checkout flows, and similar
-- Additional networks (TRON with energy optimization, etc.)
-- KYB provider integration hooks (required before multi-tenant mode can ship)
-
+- [x] Dockerfiles for the core services — written and tested working, see [`DOCKER.md`](./DOCKER.md)
+- [ ] Package and document the rest of the deployment story so others can stand up their own instance
 ## Supported networks (in progress)
 
-- **EVM** — Ethereum mainnet + L2s (Base, etc.) — *current development network*
-- **Solana** — *planned (Phase 3)*
-- **Esplora-compatible** (Bitcoin and similar UTXO chains) — *planned (Phase 3)*
+- **EVM** — Ethereum mainnet + L2s (Base, etc.) — *complete, current reference network*
+- **Solana** — *in progress (Phase 2), mostly done*
+- **Esplora-compatible** (Bitcoin and similar UTXO chains) — *planned (Phase 2, after Solana)*
 
 Token support is designed to be cheap to extend: most EVM tokens reuse the same handler logic with different addresses/decimals, so adding a new ERC-20/BEP-20-style token is close to a config change rather than new code.
-
+ 
 ## Payment flows
 
 Two ways to pay an invoice, by design:
