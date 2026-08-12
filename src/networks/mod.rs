@@ -116,7 +116,7 @@ impl NetworkRegistry {
                     println!("    └─ Contract Address: ⚠️ None configured");
                 }
 
-                let network = Arc::new(evm::EVMNetwork::new(chain_id, urls, contract_address));
+                let network = Arc::new(evm::EVMNetwork::new(chain_id, name, urls, contract_address));
                 evm.insert(chain_id, network.clone());
 
                 // Spawn background payment watcher task

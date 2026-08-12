@@ -5,6 +5,7 @@ use tower_http::compression::CompressionLayer;
 use std::env;
 use std::sync::Arc;
 use axum::{routing::{get, post}, Router};
+use crate::api::invoices::{get_invoice_checkout_handler, get_invoice_status_handler};
 
 // Register our modules globally
 mod networks;
@@ -60,6 +61,11 @@ async fn main() {
 
     // 2. Pass the singletons down to the token registry so handlers can clone the Arcs
     let registry = Arc::new(tokens::TokenRegistry::new(networks.clone()));
+    registry
+        .sync_checkout_views(&pool)
+        .await
+        .expect("Failed to sync checkout views");
+
 
     // 3. Instantiate Orchestrator and pass the required dependencies
     let orchestrator = Arc::new(orchestrator::PaymentOrchestrator::new(
@@ -84,7 +90,8 @@ async fn main() {
         .route("/api/invoices", post(api::invoices::create_invoice_handler))
         .route("/api/merchants", post(api::merchants::signup_merchant_handler))
         .route("/invoice", get(api::invoices::invoice_redirect_handler))
-        .route("/api/invoices/{id}", get(api::invoices::get_invoice_handler))
+        .route("/api/invoices/{id}/checkout", get(get_invoice_checkout_handler))
+        .route("/api/invoices/{id}/status",   get(get_invoice_status_handler))
 
         // Inspection / Test routes
         .route("/api/test/tokens", get(api::tests::list_tokens_test_handler))

@@ -1,11 +1,14 @@
 use crate::networks::sol::SolanaNetwork;
 use crate::networks::{NetworkClient, NetworkRegistry, SolanaCluster};
-use crate::tokens::{decrypt_data, PaymentDetails, TokenHandler, TokenRegistry};
+use crate::tokens::{decrypt_data, CheckoutContext, CheckoutView, PaymentDetails, TokenHandler, TokenRegistry};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
 use std::sync::Arc;
+use serde_json::{json, Value};
 use uuid::Uuid;
+use crate::tokens::sol_common::sol_checkout_data;
+
 pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
@@ -71,6 +74,12 @@ pub const DEVNET_TOKENS: &[TokenConfig] = &[
     },
 ];
 
+pub const CHECKOUT_VIEW: CheckoutView = CheckoutView {
+    id: "sol",
+    path: "/checkout/sol.html",
+    description: "Solana checkout: owner-address QR + Solana Pay transfer with reference.",
+};
+
 pub fn register(registry: &mut TokenRegistry, networks: Arc<NetworkRegistry>) {
     let network = match networks.sol_cluster(SolanaCluster::Devnet) {
         Some(net) => net,
@@ -107,6 +116,19 @@ impl TokenHandler for DevnetHandler {
     fn token_id(&self) -> &str {
         self.config.id
     }
+
+    fn checkout_view(&self) -> CheckoutView {
+        CHECKOUT_VIEW
+    }
+
+    async fn checkout_data(
+        &self,
+        _pool: &PgPool,
+        ctx: &CheckoutContext,
+    ) -> Result<Value, String> {
+        sol_checkout_data(&self.network, self.config.name, self.config.decimals, ctx)
+    }
+
 
     async fn create_invoice_payment(
         &self,
@@ -290,4 +312,5 @@ impl TokenHandler for DevnetHandler {
         println!("DevnetHandler::cancel_payment({invoice_id}) for token: {}", self.config.id);
         Ok(())
     }
+
 }

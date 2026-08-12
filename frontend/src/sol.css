@@ -1,0 +1,103 @@
+@import "tailwindcss";
+
+/* --------------------------------------------------------------------------
+   Solana checkout theme
+   Palette is deliberately narrow: an ink field, two panel greys, one hairline,
+   and the Solana purple->teal gradient as the only chromatic event on the page.
+   Amber shows up once, on the "wrong network" warning, and nowhere else.
+   -------------------------------------------------------------------------- */
+@theme {
+  --color-ink:      #07070b;
+  --color-panel:    #0e0e14;
+  --color-panel-2:  #14141d;
+  --color-line:     #1f1f2b;
+  --color-mist:     #85859c;
+  --color-chalk:    #e8e8f0;
+
+  --color-sol-purple: #9945ff;
+  --color-sol-teal:   #14f195;
+  --color-amber:      #f5a524;
+  --color-rose:       #ff5c7a;
+
+  --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --radius-panel: 14px;
+}
+
+@layer base {
+  html {
+    background-color: var(--color-ink);
+    color-scheme: dark;
+  }
+
+  body {
+    font-family: var(--font-display);
+    /* One ambient light source, top-centre, behind the card. Nothing moves. */
+    background-image:
+      radial-gradient(60rem 30rem at 50% -14rem, rgba(153, 69, 255, 0.18), transparent 70%),
+      radial-gradient(40rem 24rem at 50% -6rem, rgba(20, 241, 149, 0.08), transparent 70%);
+    background-repeat: no-repeat;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-sol-teal);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: rgba(153, 69, 255, 0.35);
+  }
+}
+
+/* Purple -> teal, used for the fuse bar, the amount, and active tab edges. */
+@utility grad-bar {
+  background-image: linear-gradient(
+    90deg,
+    var(--color-sol-purple) 0%,
+    #7a5bff 35%,
+    #19c8c8 70%,
+    var(--color-sol-teal) 100%
+  );
+}
+
+@utility grad-text {
+  background-image: linear-gradient(100deg, #c9a4ff 0%, var(--color-chalk) 45%, var(--color-sol-teal) 100%);
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+}
+
+/* Section eyebrows: small, wide-tracked, never louder than the data below. */
+@utility eyebrow {
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--color-mist);
+}
+
+@utility panel-edge {
+  border: 1px solid var(--color-line);
+  background-color: var(--color-panel);
+  border-radius: var(--radius-panel);
+}
+
+/* Slow breath on the "waiting for payment" dot. Nothing else pulses. */
+@keyframes sol-breathe {
+  0%, 100% { opacity: 0.25; transform: scale(0.85); }
+  50%      { opacity: 1;    transform: scale(1); }
+}
+
+@utility breathe {
+  animation: sol-breathe 2.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

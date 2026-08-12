@@ -1,11 +1,13 @@
 use crate::networks::evm::EVMNetwork;
 use crate::networks::{NetworkClient, NetworkRegistry};
-use crate::tokens::{decrypt_data, PaymentDetails, TokenHandler, TokenRegistry};
+use crate::tokens::{decrypt_data, CheckoutContext, CheckoutView, PaymentDetails, TokenHandler, TokenRegistry};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
 use std::sync::Arc;
+use serde_json::{json, Value};
 use uuid::Uuid;
+use crate::tokens::evm_common::evm_checkout_data;
 
 #[derive(Debug, Clone)]
 pub struct TokenConfig {
@@ -57,6 +59,15 @@ pub const BASE_SEPOLIA_TOKENS: &[TokenConfig] = &[
         required_confirmations: 5,
     },
 ];
+
+pub const CHECKOUT_VIEW: CheckoutView = CheckoutView {
+    id: "evm",
+    path: "/checkout/evm.html",
+    description: "EVM checkout: deposit QR + vault call with optional ERC-20 approval step.",
+};
+
+const BLOCK_EXPLORER: &str = "https://sepolia.basescan.org";
+const CHAIN_NAME: &str = "Base Sepolia";
 
 pub fn register(registry: &mut TokenRegistry, networks: Arc<NetworkRegistry>) {
     let network = match networks.evm_chain(84532) {
@@ -189,6 +200,19 @@ impl TokenHandler for BaseSepoliaHandler {
             expires_at,
         })
     }
+
+    fn checkout_view(&self) -> CheckoutView {
+        CHECKOUT_VIEW
+    }
+
+    async fn checkout_data(
+        &self,
+        pool: &PgPool,
+        ctx: &CheckoutContext,
+    ) -> Result<Value, String> {
+        evm_checkout_data(&self.network, &self.config, pool, ctx).await
+    }
+
     async fn cancel_payment(&self, _pool: &PgPool, invoice_id: Uuid) -> Result<(), String> {
         println!("BaseSepoliaHandler::cancel_payment({invoice_id}) for token: {}", self.config.id);
         Ok(())

@@ -509,6 +509,20 @@ impl SolanaNetwork {
             .to_string()
     }
 
+    pub fn cluster(&self) -> SolanaCluster {
+        self.cluster
+    }
+
+    /// Standard Solana cluster moniker. Safe to show a payer (e.g. a "Devnet"
+    /// banner) — unlike rpc_urls, this reveals nothing about infrastructure.
+    pub fn cluster_label(&self) -> &'static str {
+        match self.cluster {
+            SolanaCluster::MainnetBeta => "mainnet-beta",
+            SolanaCluster::Testnet => "testnet",
+            SolanaCluster::Devnet => "devnet",
+        }
+    }
+    
     // ── RPC ──────────────────────────────────────────────────────────────────
 
     async fn rpc(&self, method: &'static str, params: Value) -> Result<Value, String> {

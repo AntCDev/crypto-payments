@@ -163,6 +163,12 @@ const NATIVE_TOKEN_SENTINEL: &str = "0x0000000000000000000000000000000000000000"
 const ERC20_TRANSFER_TOPIC0: &str =
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
+pub const DEFAULT_VAULT_PAY_ABI: &str =
+    "function pay(address token, uint256 amount, bytes16 identifier, address merchant)";
+
+pub const DEFAULT_VAULT_PAY_NATIVE_ABI: &str =
+    "function payNative(bytes16 identifier, address merchant) payable";
+
 fn address_to_topic(addr_lc: &str) -> String {
     format!("0x{:0>64}", addr_lc.trim_start_matches("0x"))
 }
@@ -322,7 +328,8 @@ struct BlockView {
 // ==========================================
 pub struct EVMNetwork {
     chain_id: u64,
-    pub network_name: String,
+    pub network_name: String,   // "EVM_84532" — DB key, never shown to payers
+    display_name: String,       // "Base Sepolia" — safe for the checkout page
     rpc_urls: Vec<String>,
     pub contract_address: Option<String>,
     client: reqwest::Client,
@@ -331,18 +338,73 @@ pub struct EVMNetwork {
 
 impl EVMNetwork {
     const REORG_WINDOW: usize = 64;
-    pub fn new(chain_id: u64, rpc_urls: Vec<String>, contract_address: Option<String>) -> Self {
-        assert!(!rpc_urls.is_empty(), "EVMNetwork requires at least one RPC URL");
-        let network_name = format!("EVM_{}", chain_id);
 
+    pub fn new(
+        chain_id: u64,
+        display_name: &str,
+        rpc_urls: Vec<String>,
+        contract_address: Option<String>,
+    ) -> Self {
+        assert!(!rpc_urls.is_empty(), "EVMNetwork requires at least one RPC URL");
         Self {
             chain_id,
-            network_name,
+            network_name: format!("EVM_{}", chain_id),
+            display_name: display_name.to_string(),
             rpc_urls,
             contract_address,
             client: reqwest::Client::new(),
             pending: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    pub fn vault_address(&self) -> Option<&str> {
+        self.contract_address.as_deref()
+    }
+
+    pub async fn merchant_wallet(
+        &self,
+        pool: &PgPool,
+        merchant_id: Uuid,
+    ) -> Result<String, String> {
+        sqlx::query_scalar!(
+            r#"
+            SELECT address
+            FROM merchant_wallets
+            WHERE merchant_id = $1 AND network_type = 'evm'
+            "#,
+            merchant_id
+        )
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("Failed to look up EVM merchant wallet: {e}"))?
+            .ok_or_else(|| {
+                format!("No EVM wallet provisioned for merchant {merchant_id}")
+            })
+    }
+
+    pub fn vault_pay_abi(&self) -> String {
+        self.abi_env("EVM_VAULT_PAY_ABI", DEFAULT_VAULT_PAY_ABI)
+    }
+
+    pub fn vault_pay_native_abi(&self) -> String {
+        self.abi_env("EVM_VAULT_PAY_NATIVE_ABI", DEFAULT_VAULT_PAY_NATIVE_ABI)
+    }
+
+    fn abi_env(&self, base_key: &str, default: &str) -> String {
+        std::env::var(format!("{base_key}_{}", self.chain_id))
+            .or_else(|_| std::env::var(base_key))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| default.to_string())
     }
 
     fn chain_ref(&self) -> String {

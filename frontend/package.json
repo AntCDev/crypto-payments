@@ -14,8 +14,13 @@
     "vite": "^8.1.1"
   },
   "dependencies": {
+    "@reown/appkit": "^1.8.23",
+    "@reown/appkit-adapter-solana": "^1.8.23",
     "@scure/bip39": "^2.2.0",
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.98.4",
     "@tailwindcss/vite": "^4.3.3",
+    "buffer": "^6.0.3",
     "qrcode": "^1.5.4",
     "tailwindcss": "^4.3.3"
   }
