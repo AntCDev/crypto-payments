@@ -18,6 +18,7 @@ pub mod base_sepolia;
 mod sol_devnet;
 mod evm_common;
 mod sol_common;
+mod bitcoin;
 
 /// A frontend checkout file, identified by ID rather than path so the path
 /// can be changed in the DB without a recompile.
