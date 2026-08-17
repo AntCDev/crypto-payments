@@ -2,7 +2,7 @@
 
 > ⚠️ **Status: Early Alpha.** The core architecture is in place and the first major phase (invoice creation, payment observation across both payment paths, and webhook delivery) is complete — this project has graduated from proof-of-concept to early alpha. That said, large parts of the system (sweeping, ledgering, non-EVM networks) are still in progress or unimplemented, and nothing here has been audited. **Do not use this in production or with real funds.** See the [Roadmap & timeline](#roadmap--timeline) for exactly where things stand.
 
-> ⚠️ **This project is custodial by design.** The operator's server generates and holds the private keys / signing authority for all merchant-facing wallets (naive-QR deposit addresses and, on EVM, the batching smart contract's admin keys). Merchants do not hold their own keys. If you run this software, you are the custodian of any funds it receives, regardless of whether the wallet is labeled as "belonging" to a merchant. See [`COMPLIANCE.md`](./COMPLIANCE.md) before deploying anywhere beyond your own local testing.
+> ⚠️ **This project is custodial by design.** The operator's server generates and holds the private keys / signing authority for every merchant wallet it creates. Merchants are able to export their own keys as a glass-break measure, which means custody is shared in practice — but the operator remains the custodian in the sense that matters legally, and remains responsible for any funds the system receives. See [`COMPLIANCE.md`](./COMPLIANCE.md) before deploying anywhere beyond your own local testing, and [`RECONCILIATION.md`](./RECONCILIATION.md) §10 for what shared custody means operationally.
 
 ## Documentation
 
@@ -10,6 +10,7 @@ Three companion documents go deeper than this README:
 
 - 📡 **[`NETWORKS.md`](./NETWORKS.md)** — implementation-level documentation of **how payments are detected**, per network: the dual payment paths, the payment lifecycle, scan cursors, reorg handling, idempotency guarantees, and the contract any new network implementation must satisfy. If you want to understand or extend the detection layer, start here.
 - 📒 **[`LEDGER.md`](./LEDGER.md)** — the design of the **ledgering system**: how on-chain activity is recorded, how merchant balances are derived, and how operator fees accrue and settle. A three-layer, double-entry, append-only design. Currently a design sketch ahead of the sweeping implementation.
+- 🔁 **[`RECONCILIATION.md`](./RECONCILIATION.md)**  — what the system does about value that arrives at, or leaves from, a controlled address without the processor having initiated it: late payments, merchant self-moves, mistaken sends, dust. Movement-driven rather than balance-driven. Currently a design sketch ahead of the sweeping and isolation work.
 - ⚖️ **[`COMPLIANCE.md`](./COMPLIANCE.md)** — a plain-language explanation of **why this software is custodial, what that tends to mean legally**, and what changes the moment you enable multi-tenant mode. Not legal advice, but required reading before deploying this anywhere real.
 
 ## Index
@@ -20,6 +21,7 @@ Three companion documents go deeper than this README:
 - [Supported networks](#supported-networks-in-progress)
 - [Payment flows](#payment-flows)
 - [Architecture](#architecture)
+- [Fund isolation](#fund-isolation)
 - [Webhooks](#webhooks)
 - [Data / correctness principles](#data--correctness-principles)
 - [Deployment modes](#deployment-modes)
@@ -66,19 +68,32 @@ Moving funds from per-invoice deposit addresses to merchant main accounts, and a
 - [ ] Gas refilling mechanics for deposit addresses that need native token to move ERC-20s
 - [ ] Full ledgering system implementation (`chain_transactions`, `chain_movements`, journals/entries)
 - [ ] Orchestrator endpoints to trigger sweeps manually and to configure the conditions under which they happen automatically
-### 🔜 Phase 4 — Hardening
-
-- [ ] Proper audit pass over the whole codebase
-### 🔜 Phase 5 — Containerization
+### 🔜 Phase 4 — Containerization
 
 - [x] Dockerfiles for the core services — written and tested working, see [`DOCKER.md`](./DOCKER.md)
 - [ ] Package and document the rest of the deployment story so others can stand up their own instance
+
+### 🔜 Phase 5 — Fund isolation & reconciliation
+
+Two related problems that are best solved together. *Isolation* is the property that no merchant's funds, gas, or signing authority ever touch another merchant's — no shared pools, no shared gas accounts. *Reconciliation* is what keeps the books correct once value starts moving for reasons the payment path did not initiate. See [`RECONCILIATION.md`](./RECONCILIATION.md).
+
+- [ ] Decide the EVM vault model — relay-only default vs optional per-merchant funded contract for batching
+- [ ] Isolation audit: confirm every network implementation actually keeps merchant funds and gas separate, and close the gaps the vault currently leaves open
+- [ ] Movement-level ingest for watched addresses — both directions, invoice-independent
+- [ ] Reconciliation journals, `external:attributed` / `external:unexplained` accounts
+- [ ] Balance probing and the unexplained-delta alarm
+- [ ] Merchant key export: used-index manifest, standalone recovery CLI, documented derivation paths per network
+
+### 🔜 Phase 6 — Hardening
+
+- [ ] Proper audit pass over the whole codebase
+
 ## Supported networks (in progress)
 
 - **EVM** — Ethereum mainnet + L2s (Base, etc.) — *complete, current reference network*
-- **Solana** — *in progress (Phase 2), mostly done*
+- **Solana** — Mainnet, devnet. *complete*
 - **Esplora-compatible** (Bitcoin and similar UTXO chains) — *planned (Phase 2, after Solana)*
-
+ 
 Token support is designed to be cheap to extend: most EVM tokens reuse the same handler logic with different addresses/decimals, so adding a new ERC-20/BEP-20-style token is close to a config change rather than new code.
  
 ## Payment flows
@@ -102,6 +117,16 @@ The system is split into three layers:
 
 This separation means adding a new chain means implementing one trait, and adding a new token on an existing chain means (in most cases) registering a handler with different parameters — not writing new payment-detection logic from scratch. The full contract a new network must satisfy is documented in [`NETWORKS.md`](./NETWORKS.md).
 
+## Fund isolation
+
+Each merchant's crypto only ever touches that merchant's crypto. There are no shared deposit pools and no shared gas accounts — a merchant's gas is funded to their own addresses, and a sweep moves their funds to their own main address. This is an accounting property first: it means every unit of value on the ledger has exactly one owner, and no reconciliation ever has to apportion a shared balance between tenants.
+
+The property is close to trivially true on networks where every address is derived from the merchant's own seed. The exception is the EVM batching vault, which is shared infrastructure by construction, and which is the reason the isolation audit is a distinct roadmap item rather than something to be assumed.
+
+Two things are called "containers" in adjacent contexts and are unrelated: this section is about **fund isolation**, while **containerization** in the roadmap means Docker.
+
+Merchants are able to export the keys to their own wallets. See [`RECONCILIATION.md`](./RECONCILIATION.md) §10.
+
 ## Webhooks
 
 Payments can be underpaid, overpaid, or corrected across multiple transactions, so the webhook model reports state rather than a single "paid" boolean. Most events are per-transaction; `payment.finished` is the exception, reported at the invoice level.
@@ -119,6 +144,7 @@ Both confirmation depths (`payment.confirmed` and `payment.finalized`) are confi
 - PostgreSQL, designed around ACID guarantees and idempotent operations — invoice creation, sweeps, and webhook dispatch are all built to be safely retryable without double-processing.
 - The ledger (in design — see [`LEDGER.md`](./LEDGER.md)) is double-entry and append-only: corrections are reversals, never edits, and merchant balances are always derived, never incremented.
 - No NFT, trading, or speculative-market functionality. This is infrastructure for accepting payment, not a wallet, exchange, or trading tool.
+- Reconciliation is movement-driven, not balance-driven: external events are ingested as attributed movements with a transaction hash and a counterparty, never as unsourced balancing entries. Value that genuinely cannot be sourced lands in a dedicated account that is expected to sit at zero and raises an alarm when it does not.
 
 ## Deployment modes
 

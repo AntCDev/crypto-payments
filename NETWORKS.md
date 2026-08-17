@@ -76,13 +76,12 @@ is a support ticket generator).
 
 ### Per-network path availability
 
-| Network             | Naive path                 | Smart path | Smart path mechanism                                                                                                                                  |
-|---------------------|----------------------------|------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **EVM**             | HD-derived deposit address | ✅          | `CustodialPaymentVault` contract call → `Payment` event carrying the invoice UUID                                                                     |
-| **Solana**          | HD-derived deposit address | ✅          | direct transfer to the merchant treasury, carrying the invoice's HD-derived pubkey as a Solana Pay `reference` — a read-only, non-signing account key |
-| **Esplora (UTXO)**  | HD-derived deposit address | ❌          | no equivalent primitive — naive only                                                                                                                  |
-| **TRON** *(future)* | HD-derived deposit address | TBD        | whatever TRON gives us for fee/energy optimization                                                                                                    |
-
+| Network             | Naive path                 | Smart path | Smart path mechanism                                                                                                                                  | Reuses deposit addresses           |
+|---------------------|----------------------------|------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------|
+| **EVM**             | HD-derived deposit address | ✅          | `CustodialPaymentVault` contract call → `Payment` event carrying the invoice UUID                                                                     | ❌                                  |
+| **Solana**          | HD-derived deposit address | ✅          | direct transfer to the merchant treasury, carrying the invoice's HD-derived pubkey as a Solana Pay `reference` — a read-only, non-signing account key | ❌                                  |
+| **Esplora (UTXO)**  | HD-derived deposit address | ❌          | no equivalent primitive — naive only                                                                                                                  | ✅ (virgin only, ≥24h after expiry) |
+| **TRON** *(future)* | HD-derived deposit address | TBD        | whatever TRON gives us for fee/energy optimization                                                                                                    | TBD                                |
 > On Solana the correlation key is an **account key, not a memo**. The wallet-connect
 > path attaches the invoice's HD-derived pubkey to the transfer as a Solana Pay
 > `reference`: read-only, non-signing, carrying no data. Because validators index
@@ -149,16 +148,18 @@ justifies it, so the state change and the notification commit or roll back toget
 
 ### Shared tables
 
-| Table                 | Purpose                                                                                                                                                                             |
-|-----------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `invoices`            | one row per invoice; `network_type`, `chain_ref`, `wallet_address`, `token_address`, `created_block`, `amount_requested`, `amount_received`, `required_confirmations`, `expires_at` |
-| `payments`            | one row per `(invoice_id, tx_hash)`; the unique index is the idempotency backbone                                                                                                   |
-| `merchant_wallets`    | merchant destination wallet per `network_type`                                                                                                                                      |
-| `network_scan_state`  | scan cursor per `(network_type, chain_ref, scope)` — `last_block` + `last_block_hash`                                                                                               |
-| `network_seen_blocks` | remembered block headers per scope, for reorg detection                                                                                                                             |
-| webhook queue         | written via `enqueue_webhook`, drained by a separate dispatcher with at-least-once semantics                                                                                        |
+| Table                  | Purpose                                                                                                                                                                             |
+|------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `invoices`             | one row per invoice; `network_type`, `chain_ref`, `wallet_address`, `token_address`, `created_block`, `amount_requested`, `amount_received`, `required_confirmations`, `expires_at` |
+| `payments`             | one row per `(invoice_id, tx_hash)`; the unique index is the idempotency backbone                                                                                                   |
+| `merchant_wallets`     | merchant destination wallet per `network_type`                                                                                                                                      |
+| `network_scan_state`   | scan cursor per `(network_type, chain_ref, scope)` — `last_block` + `last_block_hash`                                                                                               |
+| `network_seen_blocks`  | remembered block headers per scope, for reorg detection                                                                                                                             |
+| `webhook queue`        | written via `enqueue_webhook`, drained by a separate dispatcher with at-least-once semantics                                                                                        |
+| `reconciliation_watch` | the bounded set of addresses under reconciliation observation — main addresses, unswept deposit addresses with known funds, shared entities. Rebuilt from the DB every tick.        |
+| `balance_probes`       | results of independent balance checks against the watch set, and the deltas they could not source                                                                                   |
 
-`scope` is what lets two independent scanners share one chain: the address scanner uses
+`scope` is what lets independent scanners share one chain: the address scanner uses `SCAN_SCOPE_ADDRESSES`, the logs scanner uses `SCAN_SCOPE_LOGS`, reconciliation ingest uses `SCAN_SCOPE_RECONCILIATION`, and none can move another's cursor.
 `SCAN_SCOPE_ADDRESSES`, the logs scanner uses `SCAN_SCOPE_LOGS`, and neither can move the
 other's cursor.
 
@@ -1015,7 +1016,7 @@ without any of the shared machinery assuming a second one exists.
 
 The contract a new `NetworkClient` has to satisfy:
 
-1. **Derive an address** from the operator mnemonic + an index (naive path).
+1. **Derive an address from a provided seed + an index** (naive path). The seed source is a parameter, not a constant: each merchant has their own seed, and index `0` is reserved for that merchant's main address on the network. The network implementation does not know or care where the seed came from.
 2. **Run at least one watcher service** that, given the DB pool, writes `payments` rows
    for money arriving against watched invoices.
 3. **Be idempotent.** Re-running any tick over the same range must produce no new
@@ -1026,6 +1027,10 @@ The contract a new `NetworkClient` has to satisfy:
    them, behind a guard that can only succeed once.
 5. **Advance its cursor only on success**, so a failed tick is a no-op.
 6. **Scope its scan state** so multiple services on one chain don't fight over one cursor.
+7. **Expose a reconciliation surface**: given a watch set of addresses, ingest **every** movement touching them in either direction, whether or not it maps to an invoice. This is a strictly larger surface than payment detection and is a separate scan scope with its own cursor. See [`RECONCILIATION.md`](./RECONCILIATION.md) §2.
+8. **Declare an address-reuse policy.** Networks that reuse deposit addresses may only reuse addresses that have never received value, and only after the invoice's expiry plus a quarantine of at least twenty-four hours.
+9. **Pin and document a derivation path**, including which mainstream wallets agree with it. A merchant importing an exported mnemonic into a third-party wallet and seeing an empty account is a recovery failure, and the divergence is worst on Solana.
+
 
 What it does *not* have to do: use the same number of services, use blocks, use a
 confirmation count, or support two payment paths. TRON, when it lands, is expected to
@@ -1051,3 +1056,4 @@ one of them, it is a bug regardless of what else it fixes.
 6. **Nothing durable lives only in memory.** The watch set is rebuilt from the DB every
    tick; the in-memory `pending` map is a hint, not state.
 7. **Amounts are base units everywhere below the presentation layer.**
+8. **An expired invoice is never resurrected by a late payment recompute** — and the value of that late payment is still recorded, through reconciliation rather than through the invoice. Invoice status is a claim about a commercial agreement; ledger balance is a claim about custody. See [`RECONCILIATION.md`](./RECONCILIATION.md) §9.
